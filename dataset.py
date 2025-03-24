@@ -16,25 +16,41 @@ class ImageDataset(Dataset[Tensor]):
         self.dataset_path = dataset_path
         self.transform = transform
 
+
     def _get_image_paths(self, dataset_path: Path) -> list[str]:
         
-        img_paths = []
-        for dir in dataset_path.iterdir():
+        img_gray_paths = []
+        img_rgb_paths = []
+        for dir in (dataset_path / "img_gray").iterdir():
             if dir.is_dir():
                 for image in dir.iterdir():
                     if image.suffix == ".png":
-                        img_paths.append(image.as_posix()) 
-        return img_paths
+                        img_gray_paths.append(image.as_posix()) 
+
+        for dir in (dataset_path / "img_rgb").iterdir():
+            if dir.is_dir():
+                for image in dir.iterdir():
+                    if image.suffix == ".png":
+                        img_rgb_paths.append(image.as_posix()) 
+        return list(zip(img_gray_paths, img_rgb_paths))
 
 
     def __len__(self) -> int:
         return len(self.img_paths)
 
     def __getitem__(self, idx: int) -> Tensor:
-        img_path = self.img_paths[idx]
-        img = pil_to_tensor(Image.open(img_path)) / 255
+        img_gray_path, img_rgb_path = self.img_paths[idx]
+
+        img_gray = pil_to_tensor(Image.open(img_gray_path)) / 255
+        img_rgb = pil_to_tensor(Image.open(img_rgb_path)) / 255
+
 
         if self.transform is not None:
-            img = img.permute(1, 2, 0).numpy()
-            img = self.transform(image=img)['image']
-        return img
+            img_gray = img_gray.permute(1, 2, 0).numpy()
+            img_rgb = img_rgb.permute(1, 2, 0).numpy()
+
+            transformed = self.transform(image=img_gray, rgb_image=img_rgb)
+            img_gray = transformed['image']
+            img_rgb = transformed['rgb_image']
+
+        return img_gray, img_rgb
