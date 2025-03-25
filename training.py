@@ -196,11 +196,10 @@ def fit_step(
         discriminator_real_output, discriminator_generated_output
     )
 
-    with torch.autograd.detect_anomaly():
-        if optimizer_G is not None:
-            optimizer_G.zero_grad()
-            total_G_loss.backward()
-            optimizer_G.step()
+    if optimizer_G is not None:
+        optimizer_G.zero_grad()
+        total_G_loss.backward()
+        optimizer_G.step()
 
     if optimizer_D is not None:
         optimizer_D.zero_grad()
