@@ -6,6 +6,41 @@
 import torch
 from torch import Tensor, nn
 
+bce = nn.BCELoss()
+l1 = nn.L1Loss()
+
+
+@torch.no_grad
+def generator_loss(
+    discriminator_G_output: Tensor,
+    generated_output: Tensor,
+    target: Tensor,
+    LAMBDA: int = 100,
+):
+    G_loss = bce(torch.ones_like(discriminator_G_output), discriminator_G_output)
+    l1_loss = l1(generated_output, target)
+
+    total_G_loss = G_loss + l1_loss * LAMBDA
+
+    total_G_loss.requires_grad = True
+    return total_G_loss, G_loss, l1_loss
+
+
+@torch.no_grad
+def discriminator_loss(
+    discriminator_real_output: Tensor, discriminator_G_output: Tensor
+):
+    real_loss = bce(
+        torch.ones_like(discriminator_real_output), discriminator_real_output
+    )
+    generated_loss = bce(
+        torch.zeros_like(discriminator_G_output), discriminator_G_output
+    )
+
+    total_D_loss = real_loss + generated_loss
+    total_D_loss.requires_grad = True
+    return total_D_loss
+
 
 class Generator(nn.Module):
     def __init__(self) -> None:
@@ -39,7 +74,7 @@ class Generator(nn.Module):
 
         self.output_layer = nn.Sequential(
             nn.ConvTranspose2d(
-                in_channels=down_filters[-1],
+                in_channels=up_filters[-1] * 2,
                 out_channels=3,
                 kernel_size=(4, 4),
                 stride=2,
@@ -58,17 +93,39 @@ class Generator(nn.Module):
 
         x = self.bottleneck(x)
 
-        for i in range(len(self.up_layers)):
-            x = self.up_layers[i](x, skip_connections[len(self.up_layers) - i - 1])
-
+        skip_connections = skip_connections[::-1]
+        for i, up_layer in enumerate(self.up_layers):
+            if i < len(skip_connections):
+                x = up_layer(x, skip_connections[i])
+            else:
+                print("NO SKIP CONNECT")
+                x = up_layer(x)
+        x = self.output_layer(x)
         return x
 
 
 class Discriminator(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        # Ck = Convolution-BatchNorm-ReLU
+        # discriminator: C64-C128-C256-C512 -> classification head (sigmoid)
 
-    def forward(self, x: Tensor) -> Tensor: ...
+        self.down1 = DownBlock(6, 64, False)
+        self.down2 = DownBlock(64, 128)
+        self.down3 = DownBlock(128, 256)
+        self.down4 = DownBlock(256, 512)
+
+        self.last = nn.Conv2d(512, 1, kernel_size=(4, 4), stride=1)
+
+    def forward(self, x_input: Tensor, x_target: Tensor) -> Tensor:
+        x = torch.concat((x_input, x_target), dim=1)
+        x = self.down1(x)
+        x = self.down2(x)
+        x = self.down3(x)
+        x = self.down4(x)
+
+        x = nn.functional.sigmoid(self.last(x))
+        return x
 
 
 class DownBlock(nn.Module):
