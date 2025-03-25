@@ -5,16 +5,25 @@
 # Usage: python training.py <dataset_path>
 
 from argparse import ArgumentParser
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
-from dataset import SampleDataset
-from network import ModelExample
 from torch import Tensor, nn
-from torch.optim import Optimizer
-from torch.utils.data import DataLoader
+from torch.optim import Adam, Optimizer
+from torch.utils.data import DataLoader, Dataset, random_split
 from torchview import draw_graph
+from tqdm import tqdm
+
+from dataset import WrappedDataLoader
+from network import Discriminator, Generator, discriminator_loss, generator_loss
+
+
+@dataclass
+class config:
+    lr: float = 0.0002
+    momentum_betas: tuple[float, float] = (0.5, 0.999)
 
 
 # sample function for model architecture visualization
@@ -47,29 +56,35 @@ def plot_learning_curves(
 
 # sample function for training
 def fit(
-    net: nn.Module,
+    G: Generator,
+    D: Discriminator,
     batch_size: int,
     epochs: int,
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
     loss: nn.Module,
-    optimizer: Optimizer,
+    optimizer_G: Optimizer,
+    optimizer_D: Optimizer,
     device: torch.device,
 ) -> tuple[list[float], list[float]]:
-    train_losses: list[float] = []
+    G_train_losses: list[float] = []
+    L1_train_losses: list[float] = []
+    D_train_losses: list[float] = []
     val_losses: list[float] = []
 
     running_loss = 0.0
     for epoch in range(epochs):
-        for batch_idx in range(0, 10):
-            # add current loss
-            running_loss += 0.1
+        G.train()
+        D.train()
+
+        for inputs, targets in tqdm(train_dataloader):
+            step_result = update_step(G, D, optimizer_G, optimizer_D, inputs, targets)
 
             # graph variables
-            train_losses.append(running_loss)
+            G_train_losses.append(step_result.total_G_loss / len())
             val_losses.append(running_loss - 0.1)
 
-        # print training info
+        # print training
         print(
             "Epoch {}, train loss: {:.5f}, val loss: {:.5f}".format(
                 epoch, running_loss / 42, running_loss / 42
@@ -78,6 +93,47 @@ def fit(
 
     print("Training finished!")
     return train_losses, val_losses
+
+
+@dataclass
+class FitStepResult:
+    total_G_loss: float
+    G_loss: float
+    G_l1_loss: float
+    D_loss: float
+
+
+def update_step(
+    G: Generator,
+    D: Discriminator,
+    optimizer_G: Optimizer | None,
+    optimizer_D: Optimizer | None,
+    inputs: Tensor,
+    targets: Tensor,
+):
+    generator_output = G(inputs)
+
+    discriminator_real_output = D(inputs.repeat(1, 3, 1, 1), targets)
+    discriminator_generated_output = D(inputs.repeat(1, 3, 1, 1), generator_output)
+
+    total_G_loss, G_loss, G_l1_loss = generator_loss(
+        discriminator_generated_output, generator_output
+    )
+    D_loss = discriminator_loss(
+        discriminator_real_output, discriminator_generated_output
+    )
+
+    if optimizer_G is not None:
+        optimizer_G.zero_grad()
+        total_G_loss.backward()
+        optimizer_G.step()
+
+    if optimizer_D is not None:
+        optimizer_D.zero_grad()
+        D_loss.backward()
+        optimizer_D.step()
+
+    return FitStepResult(total_G_loss, G_loss, G_l1_loss, D_loss)
 
 
 # declaration for this function should not be changed
@@ -97,27 +153,67 @@ def training(dataset_path: Path) -> None:
     print("Computing with {}!".format(device))
 
     batch_size = 64
-    train_dataset, val_dataset = SampleDataset(), SampleDataset()
-    train_dataloader, val_dataloader = None, None
 
-    net = ModelExample()
+    dataset = Dataset(dataset_path)
+
+    train_dataset, val_dataset, _ = split_dataset(dataset, 0.15, 0.1)
+
+    train_dataloader = WrappedDataLoader(
+        DataLoader(train_dataset, batch_size=batch_size), device
+    )
+    val_dataloader = WrappedDataLoader(
+        DataLoader(val_dataset, batch_size=batch_size, shuffle=True), device
+    )
+
+    D = Discriminator()
+    G = Generator()
+
     input_sample = torch.zeros((1, 512, 1024))
-    draw_network_architecture(net, input_sample)
+    draw_network_architecture(D, input_sample)
 
     # define optimizer and learning rate
-    optimizer = None
-
+    optimizer_G = Adam(lr=config.lr, betas=config.momentum_betas)
+    optimizer_D = Adam(lr=config.lr, betas=config.momentum_betas)
     # define loss function
-    loss = None
 
     # train the network
     train_losses, val_losses = fit(
-        net, batch_size, 3, train_dataloader, val_dataloader, loss, optimizer, device
+        D,
+        G,
+        batch_size,
+        3,
+        train_dataloader,
+        val_dataloader,
+        optimizer_G,
+        optimizer_D,
+        device,
     )
 
     # save the trained model and plot the losses, feel free to create your own functions
     torch.save(net.state_dict(), "model.pt")
     plot_learning_curves(train_losses, val_losses)
+
+
+def split_dataset(
+    dataset: Dataset, test_size: float = 0.15, val_size: float = 0.10
+) -> tuple[Dataset, Dataset, Dataset]:
+    train_ratio = 1.0 - test_size
+
+    train_size, test_size = (
+        int(len(dataset) * train_ratio),
+        len(dataset) - (int(len(dataset) * train_ratio)),
+    )
+
+    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    val_ratio = 1.0 - val_size
+    train_size, val_size = (
+        int(len(train_dataset) * val_ratio),
+        len(train_dataset) - (int(len(train_dataset) * val_ratio)),
+    )
+
+    train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+
+    return (train_dataset, val_dataset, test_dataset)
 
 
 # #### code below should not be changed ############################################################################
