@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import mlflow
 import torch
 from torch import Tensor, nn
 from torch.optim import Adam, Optimizer
@@ -23,7 +24,8 @@ from network import Discriminator, Generator, discriminator_loss, generator_loss
 
 @dataclass
 class config:
-    lr: float = 0.0002
+    G_lr: float = 0.0002
+    D_lr: float = 0.00002
     momentum_betas: tuple[float, float] = (0.5, 0.999)
 
 
@@ -91,6 +93,7 @@ def generate_image(
     path = f"gen_images/generated_image_{epoch}.png"
     print(f"Sample colorized image saved to {path}")
     plt.savefig(path)
+    plt.close()
 
 
 # sample function for training
@@ -125,7 +128,9 @@ def fit(
         train_L1_loss = 0.0
 
         for inputs, targets in tqdm(train_dataloader):
-            step_result = fit_step(G, D, optimizer_G, optimizer_D, inputs, targets)
+            step_result = fit_step(
+                G, D, optimizer_G, optimizer_D, inputs, targets, device
+            )
 
             train_G_loss += step_result.total_G_loss.item()
             train_D_loss += step_result.D_loss.item()
@@ -147,7 +152,7 @@ def fit(
         with torch.no_grad():
             for inputs, targets in tqdm(val_dataloader):
                 step_result = fit_step(
-                    G, D, None, None, inputs, targets
+                    G, D, None, None, inputs, targets, device
                 )  # optimizers are none -> don't update
 
                 val_G_loss += step_result.total_G_loss.item()
@@ -161,6 +166,15 @@ def fit(
         torch.cuda.synchronize()
         epoch_end_time = time.time()
 
+        mlflow.log_metric("train_G_loss", train_G_loss, step=epoch)
+        mlflow.log_metric("train_D_loss", train_D_loss, step=epoch)
+        mlflow.log_metric("train_L1_loss", train_L1_loss, step=epoch)
+        mlflow.log_metric("val_G_loss", val_G_loss, step=epoch)
+        mlflow.log_metric("val_D_loss", val_D_loss, step=epoch)
+        mlflow.log_metric("val_L1_loss", val_L1_loss, step=epoch)
+        mlflow.log_metric(
+            "epoch_duration", epoch_end_time - epoch_start_time, step=epoch
+        )
         print(
             f"Epoch: {epoch}, time_elapsed: {epoch_end_time - epoch_start_time:.2f} seconds | ",
             f"train_G_loss: {train_G_loss:.3f} | train_L1_loss: {train_L1_loss:.3f} | train_D_loss: {train_D_loss:.3f} | ",
@@ -180,13 +194,16 @@ def fit_step(
     optimizer_D: Optimizer | None,
     inputs: Tensor,
     targets: Tensor,
+    device: torch.device,
 ):
-    generator_output = G(inputs)
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        generator_output = G(inputs)
 
     inputs = inputs.repeat(1, 3, 1, 1)
 
-    discriminator_real_output = D(inputs, targets)
-    discriminator_generated_output = D(inputs, generator_output)
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        discriminator_real_output = D(inputs, targets)
+        discriminator_generated_output = D(inputs, generator_output)
 
     total_G_loss, G_loss, G_l1_loss = generator_loss(
         discriminator_generated_output, generator_output, targets
@@ -223,6 +240,19 @@ def training(dataset_path: Path) -> None:
     # Check for available GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Computing with {}!".format(device))
+    # Set our tracking server uri for logging
+    mlflow.set_tracking_uri(uri="http://127.0.0.1:8080")
+
+    # Create a new MLflow Experiment
+
+    run_name = "condGAN_01_300_epoch"
+    mlflow.set_experiment("Colorization_01")
+
+    try:
+        mlflow.start_run(run_name=run_name)
+    except:
+        mlflow.end_run()
+        mlflow.start_run()
 
     batch_size = 128
 
@@ -231,10 +261,11 @@ def training(dataset_path: Path) -> None:
     train_dataset, val_dataset, _ = split_dataset(img_paths_df, 0.15, 0.1)
 
     train_dataloader = WrappedDataLoader(
-        DataLoader(train_dataset, batch_size=batch_size), device
+        DataLoader(train_dataset, batch_size=batch_size, num_workers=12), device
     )
     val_dataloader = WrappedDataLoader(
-        DataLoader(val_dataset, batch_size=batch_size, shuffle=True), device
+        DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=2),
+        device,
     )
 
     torch.set_float32_matmul_precision("high")
@@ -248,15 +279,15 @@ def training(dataset_path: Path) -> None:
     )
 
     # define optimizer and learning rate
-    optimizer_G = Adam(G.parameters(), lr=config.lr, betas=config.momentum_betas)
-    optimizer_D = Adam(D.parameters(), lr=config.lr, betas=config.momentum_betas)
+    optimizer_G = Adam(G.parameters(), lr=config.G_lr, betas=config.momentum_betas)
+    optimizer_D = Adam(D.parameters(), lr=config.D_lr, betas=config.momentum_betas)
     # define loss function
 
     # train the network
     train_losses, val_losses = fit(
         G,
         D,
-        3,
+        300,
         train_dataloader,
         val_dataloader,
         optimizer_G,
@@ -265,6 +296,10 @@ def training(dataset_path: Path) -> None:
         val_dataset[0][1].to(device),
         device,
     )
+
+    torch.save(G.state_dict(), Path(f"models/G_{run_name}.pt"))
+    torch.save(D.state_dict(), Path(f"models/D_{run_name}.pt"))
+    mlflow.end_run()
 
 
 # #### code below should not be changed ############################################################################

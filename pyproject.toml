@@ -9,6 +9,7 @@ dependencies = [
     "graphviz>=0.20.3",
     "ipykernel>=6.29.5",
     "matplotlib>=3.10.1",
+    "mlflow>=2.21.2",
     "numpy>=2.2.3",
     "pillow>=11.1.0",
     "polars>=1.25.2",
