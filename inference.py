@@ -1,4 +1,4 @@
-# STUDENT's UCO: 000000
+# STUDENT's UCO: 505941
 
 # Description:
 # This file should be used for performing inference on a network
@@ -9,8 +9,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from network import ModelExample
 from PIL import Image
+from torchvision.transforms.functional import pil_to_tensor
+from tqdm import tqdm
+
+from network import Generator
+
+
+def get_image_paths(dataset_path: Path):
+    return list(dataset_path.rglob("*.png"))
 
 
 # declaration for this function should not be changed
@@ -32,15 +39,29 @@ def inference(dataset_path: Path, model_path: Path) -> None:
     print("Computing with {}!".format(device))
 
     # loading the model
-    model = ModelExample()
+    model = Generator().to(device)
     state_dict = torch.load(model_path)
     model.load_state_dict(state_dict)
     model.eval()
 
-    for i in range(0, 3):
-        # generate a random image and save it to output_predictions
-        random_image = np.astype(np.random.rand(50, 50, 3) * 255, np.uint8)
-        Image.fromarray(random_image).save(f"output_predictions/random_image_{i}.png")
+    img_paths = get_image_paths(dataset_path)
+    print(img_paths)
+
+    for input_img_path in tqdm(img_paths):
+        input_img = pil_to_tensor(Image.open(input_img_path)) / 255
+
+        if input_img.shape[0] > 1:  # input img has more than 1 channel
+            input_img = input_img[0].unsqueeze(0)
+        input_img.unsqueeze_(0)
+        generated_image = model(input_img.to(device))[0]
+        generated_image = generated_image.permute(1, 2, 0).detach().cpu().numpy()
+        generated_image = (generated_image * 255).astype(np.uint8)
+
+        dir_path = Path("output_predictions")
+        dir_path.mkdir(exist_ok=True)
+        path_to_save = dir_path / input_img_path.name
+        print(f"Saving to: {path_to_save}")
+        Image.fromarray(generated_image).save(path_to_save)
 
 
 # #### code below should not be changed ############################################################################

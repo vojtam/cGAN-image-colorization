@@ -1,30 +1,31 @@
-# STUDENT's UCO: 000000
+# STUDENT's UCO: 505941
 
 # Description:
 # This file should be used for performing training of a network
 # Usage: python training.py <dataset_path>
 
+import time
 from argparse import ArgumentParser
 from dataclasses import dataclass
 from pathlib import Path
 
-import albumentations as A
 import matplotlib.pyplot as plt
+import mlflow
 import torch
-from albumentations.pytorch import ToTensorV2
 from torch import Tensor, nn
 from torch.optim import Adam, Optimizer
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader
 from torchview import draw_graph
 from tqdm import tqdm
 
-from dataset import ImageDataset, WrappedDataLoader
-from network import Discriminator, Generator, discriminator_loss, generator_loss
+from dataset import WrappedDataLoader, get_image_paths_df, split_dataset
+from network import Discriminator, Generator
 
 
 @dataclass
 class config:
-    lr: float = 0.0002
+    G_lr: float = 0.0002
+    D_lr: float = 0.00002
     momentum_betas: tuple[float, float] = (0.5, 0.999)
 
 
@@ -56,8 +57,21 @@ def plot_learning_curves(
     plt.savefig("learning_curves.png")
 
 
+@dataclass
+class FitStepResult:
+    total_G_loss: float
+    G_loss: float
+    G_l1_loss: float
+    D_loss: float
+
+
 def generate_image(
-    model: Generator, input: Tensor, target: Tensor, plot_subtitle: str = ""
+    model: Generator,
+    input: Tensor,
+    target: Tensor,
+    epoch: int,
+    plot_subtitle: str = "",
+    save: bool = True,
 ):
     # input has a shape C x H x W
     # target has a shape C x H x W
@@ -81,11 +95,16 @@ def generate_image(
             plt.imshow(display_list[i] * 0.5 + 0.5)
         plt.axis("off")
     plt.suptitle(plot_subtitle)
+    if save:
+        path = f"gen_images/generated_image_{epoch}.png"
+        print(f"Sample colorized image saved to {path}")
+        plt.savefig(path)
+        plt.close()
+    else:
+        plt.show()
 
 
 # sample function for training
-
-
 def fit(
     G: Generator,
     D: Discriminator,
@@ -94,6 +113,8 @@ def fit(
     val_dataloader: DataLoader,
     optimizer_G: Optimizer,
     optimizer_D: Optimizer,
+    input_to_vizu: Tensor,
+    target_to_vizu: Tensor,
     device: torch.device,
 ) -> tuple[list[float], list[float]]:
     G_train_losses: list[float] = []
@@ -104,74 +125,130 @@ def fit(
     L1_val_losses: list[float] = []
     D_val_losses: list[float] = []
 
+    gan_loss = GANLoss().to(device)
+    L1_loss = torch.nn.L1Loss()
+
     for epoch in range(epochs):
         G.train()
         D.train()
+        torch.cuda.synchronize()
+        epoch_start_time = time.time()
+
+        train_G_loss = 0.0
+        train_D_loss = 0.0
+        train_L1_loss = 0.0
 
         for inputs, targets in tqdm(train_dataloader):
-            step_result = fit_step(G, D, optimizer_G, optimizer_D, inputs, targets)
+            step_result = fit_step(
+                G,
+                D,
+                optimizer_G,
+                optimizer_D,
+                inputs,
+                targets,
+                device,
+                gan_loss,
+                L1_loss,
+                100,
+            )
 
-            # graph variables
-            G_train_losses.append(step_result.total_G_loss.cpu())
-            D_train_losses.append(step_result.D_loss.cpu())
-            L1_train_losses.append(step_result.G_l1_loss.cpu())
+            train_G_loss += step_result.total_G_loss.item()
+            train_D_loss += step_result.D_loss.item()
+            train_L1_loss += step_result.G_l1_loss.item()
+
+        n_train_batches = len(train_dataloader)
+        G_train_losses.append(train_G_loss / n_train_batches)
+        D_train_losses.append(train_D_loss / n_train_batches)
+        L1_train_losses.append(train_L1_loss / n_train_batches)
 
         G.eval()
         D.eval()
+
+        val_G_loss = 0.0
+        val_D_loss = 0.0
+        val_L1_loss = 0.0
+        n_val_batches = len(val_dataloader)
+
         with torch.no_grad():
             for inputs, targets in tqdm(val_dataloader):
                 step_result = fit_step(
-                    G, D, None, None, inputs, targets
+                    G,
+                    D,
+                    None,
+                    None,
+                    inputs,
+                    targets,
+                    device,
+                    gan_loss,
+                    L1_loss,
+                    100,
                 )  # optimizers are none -> don't update
 
-                # graph variables
-                G_val_losses.append(step_result.total_G_loss)
-                D_val_losses.append(step_result.D_loss)
-                L1_val_losses.append(step_result.G_l1_loss)
+                val_G_loss += step_result.total_G_loss.item()
+                val_D_loss += step_result.D_loss.item()
+                val_L1_loss += step_result.G_l1_loss.item()
 
-        # print training
+        G_val_losses.append(val_G_loss / n_val_batches)
+        D_val_losses.append(val_D_loss / n_val_batches)
+        L1_val_losses.append(val_L1_loss / n_val_batches)
 
+        torch.cuda.synchronize()
+        epoch_end_time = time.time()
+
+        mlflow.log_metric("train_G_loss", train_G_loss, step=epoch)
+        mlflow.log_metric("train_D_loss", train_D_loss, step=epoch)
+        mlflow.log_metric("train_L1_loss", train_L1_loss, step=epoch)
+        mlflow.log_metric("val_G_loss", val_G_loss, step=epoch)
+        mlflow.log_metric("val_D_loss", val_D_loss, step=epoch)
+        mlflow.log_metric("val_L1_loss", val_L1_loss, step=epoch)
+        mlflow.log_metric(
+            "epoch_duration", epoch_end_time - epoch_start_time, step=epoch
+        )
         print(
-            f"Epoch: {epoch}, train_G_loss: {G_train_losses[-1]:.3f} | train_L1_loss: {L1_train_losses[-1]:.3f} | train_D_loss: {D_train_losses[-1]:.3f}"
+            f"Epoch: {epoch}, time_elapsed: {epoch_end_time - epoch_start_time:.2f} seconds | ",
+            f"train_G_loss: {train_G_loss:.3f} | train_L1_loss: {train_L1_loss:.3f} | train_D_loss: {train_D_loss:.3f} | ",
+            f"val_G_loss: {val_G_loss:.3f} | val_L1_loss: {val_L1_loss:.3f} | val_D_loss: {val_D_loss:.3f}",
+            sep="\n",
         )
 
-        print(
-            f"Epoch: {epoch}, val_G_loss: {G_val_losses[-1]:.3f} | val_L1_loss: {L1_val_losses[-1]:.3f} | val_D_loss: {D_val_losses[-1]:.3f}"
-        )
-        print(inputs[-1].shape)
-        generate_image(G, inputs[-1], targets[-1], f"epoch: {epoch}")
+        generate_image(G, input_to_vizu, target_to_vizu, epoch, f"epoch: {epoch}")
     print("Training finished!")
     return G_train_losses, D_train_losses
 
 
-@dataclass
-class FitStepResult:
-    total_G_loss: float
-    G_loss: float
-    G_l1_loss: float
-    D_loss: float
+class GANLoss(torch.nn.Module):
+    """
+
+    Attribution: https://towardsdatascience.com/colorizing-black-white-images-with-u-net-and-conditional-gan-a-tutorial-81b2df111cd8/
+    """
+
+    def __init__(self, real_label=1.0, fake_label=0.0):
+        super().__init__()
+        self.register_buffer(
+            "real_label", torch.tensor(real_label, dtype=torch.bfloat16)
+        )
+        self.register_buffer(
+            "fake_label", torch.tensor(fake_label, dtype=torch.bfloat16)
+        )
+        self.loss = nn.BCELoss()
+
+    def get_labels(self, preds, target_is_real):
+        if target_is_real:
+            labels = self.real_label
+        else:
+            labels = self.fake_label
+        return labels.expand_as(preds)
+
+    def __call__(self, preds, target_is_real):
+        labels = self.get_labels(preds, target_is_real)
+        loss = self.loss(preds, labels)
+        return loss
 
 
-def split_dataset(
-    dataset: Dataset, test_size: float = 0.15, val_size: float = 0.10
-) -> tuple[Dataset, Dataset, Dataset]:
-    train_ratio = 1.0 - test_size
-
-    train_size, test_size = (
-        int(len(dataset) * train_ratio),
-        len(dataset) - (int(len(dataset) * train_ratio)),
-    )
-
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-    val_ratio = 1.0 - val_size
-    train_size, val_size = (
-        int(len(train_dataset) * val_ratio),
-        len(train_dataset) - (int(len(train_dataset) * val_ratio)),
-    )
-
-    train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
-
-    return (train_dataset, val_dataset, test_dataset)
+def set_requires_grad(net, requires_grad=False):
+    if net is not None:
+        for param in net.parameters():
+            param.requires_grad = requires_grad
 
 
 def fit_step(
@@ -181,48 +258,39 @@ def fit_step(
     optimizer_D: Optimizer | None,
     inputs: Tensor,
     targets: Tensor,
+    device: torch.device,
+    gan_loss: GANLoss,
+    L1_loss: torch.nn.L1Loss,
+    LAMBDA: int = 100,
 ):
-    generator_output = G(inputs)
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        generator_output = G(inputs)
 
-    inputs = inputs.repeat(1, 3, 1, 1)
+        inputs = inputs.repeat(1, 3, 1, 1)
+        fake = torch.concat((inputs, generator_output), dim=1)
+        real = torch.concat((inputs, targets), dim=1)
+        discriminator_generated_output = D(fake.detach())
+        discriminator_real_output = D(real)
 
-    discriminator_real_output = D(inputs, targets)
-    discriminator_generated_output = D(inputs, generator_output)
-
-    total_G_loss, G_loss, G_l1_loss = generator_loss(
-        discriminator_generated_output, generator_output, targets
-    )
-    D_loss = discriminator_loss(
-        discriminator_real_output, discriminator_generated_output
-    )
-
-    if optimizer_G is not None:
-        optimizer_G.zero_grad()
-        total_G_loss.backward()
-        optimizer_G.step()
+    D_fake_loss = gan_loss(discriminator_generated_output, False)
+    D_real_loss = gan_loss(discriminator_real_output, True)
+    D_loss = (D_fake_loss + D_real_loss) * 0.5
 
     if optimizer_D is not None:
         optimizer_D.zero_grad()
         D_loss.backward()
         optimizer_D.step()
 
-    return FitStepResult(total_G_loss, G_loss, G_l1_loss, D_loss)
+    G_loss = gan_loss(discriminator_generated_output.detach(), True)
+    G_L1_loss = L1_loss(generator_output, targets) * LAMBDA
+    G_total_loss = G_loss + G_L1_loss
 
+    if optimizer_G is not None:
+        optimizer_G.zero_grad()
+        G_total_loss.backward()
+        optimizer_G.step()
 
-def get_train_transforms():
-    train_transform = A.Compose(
-        [
-            A.Resize(600, 420),
-            A.RandomCrop(512, 384),  # 4x3
-            A.HorizontalFlip(p=0.5),
-            A.Rotate(limit=30, p=0.5),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.2),
-            A.Normalize(normalization="min_max"),
-            ToTensorV2(),
-        ],
-        additional_targets={"rgb_image": "image"},
-    )
-    return train_transform
+    return FitStepResult(G_total_loss, G_loss, G_L1_loss, D_loss)
 
 
 # declaration for this function should not be changed
@@ -240,32 +308,66 @@ def training(dataset_path: Path) -> None:
     # Check for available GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Computing with {}!".format(device))
+    # Set our tracking server uri for logging
+    mlflow.set_tracking_uri(uri="http://127.0.0.1:8080")
 
-    batch_size = 4
+    # Create a new MLflow Experiment
 
-    dataset = ImageDataset(dataset_path, get_train_transforms(), n=40)
+    run_name = "condGAN_03_300_epoch"
+    mlflow.set_experiment("Colorization_01")
 
-    train_dataset, val_dataset, _ = split_dataset(dataset, 0.15, 0.1)
+    try:
+        mlflow.start_run(run_name=run_name)
+    except:
+        mlflow.end_run()
+        mlflow.start_run()
+
+    batch_size = 128
+
+    img_paths_df = get_image_paths_df(dataset_path)
+
+    train_dataset, val_dataset, _ = split_dataset(img_paths_df, 0.15, 0.1)
 
     train_dataloader = WrappedDataLoader(
-        DataLoader(train_dataset, batch_size=batch_size), device
+        DataLoader(train_dataset, batch_size=batch_size, num_workers=12), device
     )
     val_dataloader = WrappedDataLoader(
-        DataLoader(val_dataset, batch_size=batch_size, shuffle=True), device
+        DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=2),
+        device,
     )
 
-    D = Discriminator()
-    G = Generator()
+    torch.set_float32_matmul_precision("high")
+
+    D = Discriminator(6).to(device)
+    G = Generator().to(device)
+
+    # D, G = (
+    #     torch.compile(D, mode="reduce-overhead"),
+    #     torch.compile(G, mode="reduce-overhead"),
+    # )
 
     # define optimizer and learning rate
-    optimizer_G = Adam(G.parameters(), lr=config.lr, betas=config.momentum_betas)
-    optimizer_D = Adam(D.parameters(), lr=config.lr, betas=config.momentum_betas)
+    optimizer_G = Adam(G.parameters(), lr=config.G_lr, betas=config.momentum_betas)
+    optimizer_D = Adam(D.parameters(), lr=config.D_lr, betas=config.momentum_betas)
     # define loss function
 
     # train the network
     train_losses, val_losses = fit(
-        G, D, 3, train_dataloader, val_dataloader, optimizer_G, optimizer_D, device
+        G,
+        D,
+        300,
+        train_dataloader,
+        val_dataloader,
+        optimizer_G,
+        optimizer_D,
+        val_dataset[0][0].to(device),
+        val_dataset[0][1].to(device),
+        device,
     )
+
+    torch.save(G.state_dict(), Path(f"models/G_{run_name}.pt"))
+    torch.save(D.state_dict(), Path(f"models/D_{run_name}.pt"))
+    mlflow.end_run()
 
 
 # #### code below should not be changed ############################################################################

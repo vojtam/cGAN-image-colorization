@@ -3,19 +3,22 @@ name = "projcode-uco"
 version = "0.1.0"
 description = ""
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "albumentations>=2.0.5",
     "graphviz>=0.20.3",
     "ipykernel>=6.29.5",
     "matplotlib>=3.10.1",
+    "mlflow>=2.21.2",
     "numpy>=2.2.3",
     "pillow>=11.1.0",
     "polars>=1.25.2",
     "ruff>=0.11.2",
+    "scikit-image>=0.25.2",
     "scikit-learn>=1.6.1",
     "torch>=2.6.0",
     "torchview>=0.2.6",
     "torchvision>=0.21.0",
     "tqdm>=4.67.1",
+    "triton>=3.2.0",
 ]
