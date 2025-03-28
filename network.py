@@ -86,11 +86,9 @@ class Generator(nn.Module):
 
         for down_layer in self.down_layers:
             x = down_layer(x)
-            print(x.shape)
             skip_connections.append(x)
 
         x = self.bottleneck(x)
-        print(f"AFTER BOTTLENECK: {x.shape}")
 
         skip_connections = skip_connections[::-1]
         for i, up_layer in enumerate(self.up_layers):
@@ -220,9 +218,13 @@ class UpBlock(nn.Module):
 
     def forward(self, x: Tensor, residual_x: Tensor) -> Tensor:
         x = self.upsample(x)
-        print(f"x: {x.shape}    |    residual: {residual_x.shape}")
-        # if x.shape[-1] == residual_x.shape[-1] - 1:  # temporarry fix TODO
-        #     pad = torch.zeros(x.shape[:-1], device=x.device)
-        #     x = torch.cat((x, pad.unsqueeze(3)), dim=-1)
-        #     print("PADDD")
+        # Note to self:
+        # in case the input image had odd resolution in any dimensions,
+        # due to using mostly stride 2, the image resolution might have gotten rounded at some point
+        # and the dimensions of the skip with the x might not be compatible =>
+        # => interpolating the single value should solve it
+        # if the shapes match, the tensor will be as it was
+        residual_x = torch.nn.functional.interpolate(
+            residual_x, size=x.shape[2:], mode="nearest"
+        )
         return torch.cat([x, residual_x], dim=1)
