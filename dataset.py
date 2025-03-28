@@ -38,6 +38,12 @@ class ImageDataset(Dataset[Tensor]):
             transformed = self.transform(image=img_gray, rgb_image=img_rgb)
             img_gray = transformed["image"]
             img_rgb = transformed["rgb_image"]
+        # img_lab = rgb2lab(img_rgb.permute(1, 2, 0).numpy()).astype(
+        #     "float32"
+        # )  # Converting RGB to L*a*b
+        # img_lab = from_numpy(img_lab).permute(2, 0, 1)
+        # L = img_lab[[0], ...] / 50.0 - 1.0  # Between -1 and 1
+        # ab = img_lab[[1, 2], ...] / 110.0  # Between -1 and 1
 
         return img_gray, img_rgb
 
@@ -79,9 +85,7 @@ def split_dataset(
     train_df, valid_df = train_test_split(train_df, test_size=val_size)
 
     train_dataset = ImageDataset(train_df, get_train_transforms())
-
     val_dataset = ImageDataset(valid_df)
-
     test_dataset = ImageDataset(test_df)
 
     return (train_dataset, val_dataset, test_dataset)
@@ -93,13 +97,13 @@ def get_image_paths_df(dataset_path: Path, n: int | None = None) -> list[str]:
     for dir in (dataset_path / "img_gray").iterdir():
         if dir.is_dir():
             for image in dir.iterdir():
-                if image.suffix == ".png":
+                if image.suffix in [".png", ".jpg"]:
                     img_gray_paths.append(image.as_posix())
 
     for dir in (dataset_path / "img_rgb").iterdir():
         if dir.is_dir():
             for image in dir.iterdir():
-                if image.suffix == ".png":
+                if image.suffix in [".png", ".jpg"]:
                     img_rgb_paths.append(image.as_posix())
     if n is not None:
         assert n < len(img_gray_paths), (
