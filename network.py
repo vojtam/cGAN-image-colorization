@@ -1,7 +1,9 @@
-# STUDENT's UCO: 000000
+# STUDENT's UCO: 505941
 
 # Description:
 # This file should contain network class. The class should subclass the torch.nn.Module class.
+
+from pathlib import Path
 
 import torch
 from torch import Tensor, nn
@@ -10,7 +12,6 @@ bce = nn.BCELoss()
 l1 = nn.L1Loss()
 
 
-@torch.no_grad
 def generator_loss(
     discriminator_G_output: Tensor,
     generated_output: Tensor,
@@ -21,12 +22,9 @@ def generator_loss(
     l1_loss = l1(generated_output, target)
 
     total_G_loss = G_loss + l1_loss * LAMBDA
-
-    total_G_loss.requires_grad = True
     return total_G_loss, G_loss, l1_loss
 
 
-@torch.no_grad
 def discriminator_loss(
     discriminator_real_output: Tensor, discriminator_G_output: Tensor
 ):
@@ -38,7 +36,6 @@ def discriminator_loss(
     )
 
     total_D_loss = real_loss + generated_loss
-    total_D_loss.requires_grad = True
     return total_D_loss
 
 
@@ -89,48 +86,94 @@ class Generator(nn.Module):
 
         for down_layer in self.down_layers:
             x = down_layer(x)
+            print(x.shape)
             skip_connections.append(x)
 
         x = self.bottleneck(x)
+        print(f"AFTER BOTTLENECK: {x.shape}")
 
         skip_connections = skip_connections[::-1]
         for i, up_layer in enumerate(self.up_layers):
-            if i < len(skip_connections):
-                x = up_layer(x, skip_connections[i])
-            else:
-                print("NO SKIP CONNECT")
-                x = up_layer(x)
+            x = up_layer(x, skip_connections[i])
         x = self.output_layer(x)
         return x
 
 
 class Discriminator(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, input_channels: int) -> None:
         super().__init__()
         # Ck = Convolution-BatchNorm-ReLU
         # discriminator: C64-C128-C256-C512 -> classification head (sigmoid)
+        self.layers = nn.Sequential(
+            DownBlock(input_channels, 64, False),
+            DownBlock(64, 128),
+            DownBlock(128, 256),
+            DownBlock(256, 512, stride=1),
+            nn.Conv2d(512, 1, kernel_size=(4, 4), stride=1, padding=1),
+        )
 
-        self.down1 = DownBlock(6, 64, False)
-        self.down2 = DownBlock(64, 128)
-        self.down3 = DownBlock(128, 256)
-        self.down4 = DownBlock(256, 512)
-
-        self.last = nn.Conv2d(512, 1, kernel_size=(4, 4), stride=1)
-
-    def forward(self, x_input: Tensor, x_target: Tensor) -> Tensor:
-        x = torch.concat((x_input, x_target), dim=1)
-        x = self.down1(x)
-        x = self.down2(x)
-        x = self.down3(x)
-        x = self.down4(x)
-
-        x = nn.functional.sigmoid(self.last(x))
+    def forward(self, x: Tensor) -> Tensor:
+        x = nn.functional.sigmoid(self.layers(x))
         return x
+
+
+class GAN(nn.Module):
+    def __init__(
+        self, G: Generator, D: Discriminator, run_name: str = "conditional_GAN_01"
+    ) -> None:
+        super().__init__()
+        self.G = G
+        self.D = D
+        self.run_name = run_name
+
+    def save_model(self, dir_to_save: Path):
+        G_filename = Path(f"G_{self.run_name}_model.pt")
+        D_filename = Path(f"D_{self.run_name}_model.pt")
+
+        try:
+            torch.save(self.G.state_dict(), dir_to_save / G_filename)
+            torch.save(self.D.state_dict(), dir_to_save / D_filename)
+            print(f"Saved the Generator model to {dir_to_save / G_filename}")
+            print(f"Saved the Discriminator model to {dir_to_save / D_filename}")
+        except Exception as e:
+            print(f"An ERROR occurred while saving: {e}")
+
+    def compute_loss(
+        self,
+        generated_image: Tensor,
+        D_real_output: Tensor,
+        D_generated_output: Tensor,
+        targets: Tensor,
+    ):
+        total_G_loss, G_loss, G_l1_loss = self.G.generator_loss(
+            D_generated_output, generated_image, targets
+        )
+
+        D_loss = self.D.discriminator_loss(D_real_output, D_generated_output)
+
+        # return FitStepResult(total_G_loss, G_loss, G_l1_loss, D_loss)
+
+    def forward(self, inputs: Tensor, targets: Tensor):
+        generator_output = self.G(inputs)
+        inputs = inputs.repeat(1, 3, 1, 1)
+        discriminator_real_output = self.D(inputs, targets)
+        discriminator_generated_output = self.D(inputs, generator_output)
+
+        return self.compute_loss(
+            generator_output,
+            discriminator_real_output,
+            discriminator_generated_output,
+            targets,
+        )
 
 
 class DownBlock(nn.Module):
     def __init__(
-        self, in_channels: int, out_channels: int, batch_norm: bool = True
+        self,
+        in_channels: int,
+        out_channels: int,
+        batch_norm: bool = True,
+        stride: int = 2,
     ) -> None:
         super().__init__()
         layers = [
@@ -138,15 +181,15 @@ class DownBlock(nn.Module):
                 in_channels=in_channels,
                 out_channels=out_channels,
                 kernel_size=(4, 4),
-                stride=2,
+                stride=stride,
                 padding=1,
                 bias=False,
             ),
-            nn.LeakyReLU(0.2),
         ]
 
         if batch_norm:
             layers.append(nn.BatchNorm2d(out_channels))
+        layers.append(nn.LeakyReLU(0.2))
         self.downsample = nn.Sequential(*layers)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -168,8 +211,8 @@ class UpBlock(nn.Module):
                 padding=1,
                 bias=False,
             ),
-            nn.ReLU(),
             nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
         )
 
         if use_dropout:
@@ -177,4 +220,9 @@ class UpBlock(nn.Module):
 
     def forward(self, x: Tensor, residual_x: Tensor) -> Tensor:
         x = self.upsample(x)
+        print(f"x: {x.shape}    |    residual: {residual_x.shape}")
+        # if x.shape[-1] == residual_x.shape[-1] - 1:  # temporarry fix TODO
+        #     pad = torch.zeros(x.shape[:-1], device=x.device)
+        #     x = torch.cat((x, pad.unsqueeze(3)), dim=-1)
+        #     print("PADDD")
         return torch.cat([x, residual_x], dim=1)
