@@ -1,4 +1,4 @@
-# STUDENT's UCO: 000000
+# STUDENT's UCO: 505941
 
 # Description:
 # This file should be used for performing training of a network
@@ -19,7 +19,7 @@ from torchview import draw_graph
 from tqdm import tqdm
 
 from dataset import WrappedDataLoader, get_image_paths_df, split_dataset
-from network import Discriminator, Generator, discriminator_loss, generator_loss
+from network import Discriminator, Generator
 
 
 @dataclass
@@ -66,7 +66,12 @@ class FitStepResult:
 
 
 def generate_image(
-    model: Generator, input: Tensor, target: Tensor, epoch: int, plot_subtitle: str = ""
+    model: Generator,
+    input: Tensor,
+    target: Tensor,
+    epoch: int,
+    plot_subtitle: str = "",
+    save: bool = True,
 ):
     # input has a shape C x H x W
     # target has a shape C x H x W
@@ -90,10 +95,13 @@ def generate_image(
             plt.imshow(display_list[i] * 0.5 + 0.5)
         plt.axis("off")
     plt.suptitle(plot_subtitle)
-    path = f"gen_images/generated_image_{epoch}.png"
-    print(f"Sample colorized image saved to {path}")
-    plt.savefig(path)
-    plt.close()
+    if save:
+        path = f"gen_images/generated_image_{epoch}.png"
+        print(f"Sample colorized image saved to {path}")
+        plt.savefig(path)
+        plt.close()
+    else:
+        plt.show()
 
 
 # sample function for training
@@ -117,6 +125,9 @@ def fit(
     L1_val_losses: list[float] = []
     D_val_losses: list[float] = []
 
+    gan_loss = GANLoss().to(device)
+    L1_loss = torch.nn.L1Loss()
+
     for epoch in range(epochs):
         G.train()
         D.train()
@@ -129,7 +140,16 @@ def fit(
 
         for inputs, targets in tqdm(train_dataloader):
             step_result = fit_step(
-                G, D, optimizer_G, optimizer_D, inputs, targets, device
+                G,
+                D,
+                optimizer_G,
+                optimizer_D,
+                inputs,
+                targets,
+                device,
+                gan_loss,
+                L1_loss,
+                100,
             )
 
             train_G_loss += step_result.total_G_loss.item()
@@ -152,7 +172,16 @@ def fit(
         with torch.no_grad():
             for inputs, targets in tqdm(val_dataloader):
                 step_result = fit_step(
-                    G, D, None, None, inputs, targets, device
+                    G,
+                    D,
+                    None,
+                    None,
+                    inputs,
+                    targets,
+                    device,
+                    gan_loss,
+                    L1_loss,
+                    100,
                 )  # optimizers are none -> don't update
 
                 val_G_loss += step_result.total_G_loss.item()
@@ -187,6 +216,41 @@ def fit(
     return G_train_losses, D_train_losses
 
 
+class GANLoss(torch.nn.Module):
+    """
+
+    Attribution: https://towardsdatascience.com/colorizing-black-white-images-with-u-net-and-conditional-gan-a-tutorial-81b2df111cd8/
+    """
+
+    def __init__(self, real_label=1.0, fake_label=0.0):
+        super().__init__()
+        self.register_buffer(
+            "real_label", torch.tensor(real_label, dtype=torch.bfloat16)
+        )
+        self.register_buffer(
+            "fake_label", torch.tensor(fake_label, dtype=torch.bfloat16)
+        )
+        self.loss = nn.BCELoss()
+
+    def get_labels(self, preds, target_is_real):
+        if target_is_real:
+            labels = self.real_label
+        else:
+            labels = self.fake_label
+        return labels.expand_as(preds)
+
+    def __call__(self, preds, target_is_real):
+        labels = self.get_labels(preds, target_is_real)
+        loss = self.loss(preds, labels)
+        return loss
+
+
+def set_requires_grad(net, requires_grad=False):
+    if net is not None:
+        for param in net.parameters():
+            param.requires_grad = requires_grad
+
+
 def fit_step(
     G: Generator,
     D: Discriminator,
@@ -195,34 +259,38 @@ def fit_step(
     inputs: Tensor,
     targets: Tensor,
     device: torch.device,
+    gan_loss: GANLoss,
+    L1_loss: torch.nn.L1Loss,
+    LAMBDA: int = 100,
 ):
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         generator_output = G(inputs)
 
-    inputs = inputs.repeat(1, 3, 1, 1)
+        inputs = inputs.repeat(1, 3, 1, 1)
+        fake = torch.concat((inputs, generator_output), dim=1)
+        real = torch.concat((inputs, targets), dim=1)
+        discriminator_generated_output = D(fake.detach())
+        discriminator_real_output = D(real)
 
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        discriminator_real_output = D(inputs, targets)
-        discriminator_generated_output = D(inputs, generator_output)
-
-    total_G_loss, G_loss, G_l1_loss = generator_loss(
-        discriminator_generated_output, generator_output, targets
-    )
-    D_loss = discriminator_loss(
-        discriminator_real_output, discriminator_generated_output
-    )
-
-    if optimizer_G is not None:
-        optimizer_G.zero_grad()
-        total_G_loss.backward()
-        optimizer_G.step()
+    D_fake_loss = gan_loss(discriminator_generated_output, False)
+    D_real_loss = gan_loss(discriminator_real_output, True)
+    D_loss = (D_fake_loss + D_real_loss) * 0.5
 
     if optimizer_D is not None:
         optimizer_D.zero_grad()
         D_loss.backward()
         optimizer_D.step()
 
-    return FitStepResult(total_G_loss, G_loss, G_l1_loss, D_loss)
+    G_loss = gan_loss(discriminator_generated_output.detach(), True)
+    G_L1_loss = L1_loss(generator_output, targets) * LAMBDA
+    G_total_loss = G_loss + G_L1_loss
+
+    if optimizer_G is not None:
+        optimizer_G.zero_grad()
+        G_total_loss.backward()
+        optimizer_G.step()
+
+    return FitStepResult(G_total_loss, G_loss, G_L1_loss, D_loss)
 
 
 # declaration for this function should not be changed
@@ -245,7 +313,7 @@ def training(dataset_path: Path) -> None:
 
     # Create a new MLflow Experiment
 
-    run_name = "condGAN_01_300_epoch"
+    run_name = "condGAN_03_300_epoch"
     mlflow.set_experiment("Colorization_01")
 
     try:
@@ -270,13 +338,13 @@ def training(dataset_path: Path) -> None:
 
     torch.set_float32_matmul_precision("high")
 
-    D = Discriminator().to(device)
+    D = Discriminator(6).to(device)
     G = Generator().to(device)
 
-    D, G = (
-        torch.compile(D, mode="reduce-overhead"),
-        torch.compile(G, mode="reduce-overhead"),
-    )
+    # D, G = (
+    #     torch.compile(D, mode="reduce-overhead"),
+    #     torch.compile(G, mode="reduce-overhead"),
+    # )
 
     # define optimizer and learning rate
     optimizer_G = Adam(G.parameters(), lr=config.G_lr, betas=config.momentum_betas)
