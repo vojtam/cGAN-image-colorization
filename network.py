@@ -3,40 +3,42 @@
 # Description:
 # This file should contain network class. The class should subclass the torch.nn.Module class.
 
-from pathlib import Path
 
 import torch
 from torch import Tensor, nn
 
-bce = nn.BCELoss()
-l1 = nn.L1Loss()
+BCELogitsLoss = nn.BCEWithLogitsLoss()
+L1Loss = torch.nn.L1Loss()
 
 
 def generator_loss(
-    discriminator_G_output: Tensor,
-    generated_output: Tensor,
-    target: Tensor,
+    discriminator_generated_output: Tensor,
+    generator_output: Tensor,
+    targets: Tensor,
     LAMBDA: int = 100,
 ):
-    G_loss = bce(torch.ones_like(discriminator_G_output), discriminator_G_output)
-    l1_loss = l1(generated_output, target)
+    labels = torch.ones_like(discriminator_generated_output, requires_grad=False)
+    bce_G_loss = BCELogitsLoss(discriminator_generated_output, labels)
 
-    total_G_loss = G_loss + l1_loss * LAMBDA
-    return total_G_loss, G_loss, l1_loss
+    L1_G_loss = L1Loss(generator_output, targets) * LAMBDA
+    return bce_G_loss, L1_G_loss
 
 
 def discriminator_loss(
-    discriminator_real_output: Tensor, discriminator_G_output: Tensor
+    discriminator_generated_output: Tensor,
+    discriminator_real_output: Tensor,
+    smoothing_factor: float | None = 0.9,
 ):
-    real_loss = bce(
-        torch.ones_like(discriminator_real_output), discriminator_real_output
-    )
-    generated_loss = bce(
-        torch.zeros_like(discriminator_G_output), discriminator_G_output
-    )
+    fake_labels = torch.zeros_like(discriminator_generated_output, requires_grad=False)
+    real_labels = torch.ones_like(discriminator_real_output, requires_grad=False)
+    if smoothing_factor is not None:
+        real_labels *= smoothing_factor
 
-    total_D_loss = real_loss + generated_loss
-    return total_D_loss
+    D_fake_loss = BCELogitsLoss(discriminator_generated_output, fake_labels)
+    D_real_loss = BCELogitsLoss(discriminator_real_output, real_labels)
+
+    D_loss = D_fake_loss + D_real_loss
+    return D_loss
 
 
 class Generator(nn.Module):
@@ -72,7 +74,7 @@ class Generator(nn.Module):
         self.output_layer = nn.Sequential(
             nn.ConvTranspose2d(
                 in_channels=up_filters[-1] * 2,
-                out_channels=3,
+                out_channels=2,
                 kernel_size=(4, 4),
                 stride=2,
                 padding=1,
@@ -111,58 +113,8 @@ class Discriminator(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        x = nn.functional.sigmoid(self.layers(x))
+        x = self.layers(x)
         return x
-
-
-class GAN(nn.Module):
-    def __init__(
-        self, G: Generator, D: Discriminator, run_name: str = "conditional_GAN_01"
-    ) -> None:
-        super().__init__()
-        self.G = G
-        self.D = D
-        self.run_name = run_name
-
-    def save_model(self, dir_to_save: Path):
-        G_filename = Path(f"G_{self.run_name}_model.pt")
-        D_filename = Path(f"D_{self.run_name}_model.pt")
-
-        try:
-            torch.save(self.G.state_dict(), dir_to_save / G_filename)
-            torch.save(self.D.state_dict(), dir_to_save / D_filename)
-            print(f"Saved the Generator model to {dir_to_save / G_filename}")
-            print(f"Saved the Discriminator model to {dir_to_save / D_filename}")
-        except Exception as e:
-            print(f"An ERROR occurred while saving: {e}")
-
-    def compute_loss(
-        self,
-        generated_image: Tensor,
-        D_real_output: Tensor,
-        D_generated_output: Tensor,
-        targets: Tensor,
-    ):
-        total_G_loss, G_loss, G_l1_loss = self.G.generator_loss(
-            D_generated_output, generated_image, targets
-        )
-
-        D_loss = self.D.discriminator_loss(D_real_output, D_generated_output)
-
-        # return FitStepResult(total_G_loss, G_loss, G_l1_loss, D_loss)
-
-    def forward(self, inputs: Tensor, targets: Tensor):
-        generator_output = self.G(inputs)
-        inputs = inputs.repeat(1, 3, 1, 1)
-        discriminator_real_output = self.D(inputs, targets)
-        discriminator_generated_output = self.D(inputs, generator_output)
-
-        return self.compute_loss(
-            generator_output,
-            discriminator_real_output,
-            discriminator_generated_output,
-            targets,
-        )
 
 
 class DownBlock(nn.Module):
