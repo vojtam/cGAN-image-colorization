@@ -23,8 +23,6 @@ from tqdm import tqdm
 from dataset import (
     WrappedDataLoader,
     get_image_paths_df,
-    lab_to_rgb_batch_np,
-    lab_to_rgb_np,
     split_dataset,
 )
 from evaluation import dssim
@@ -110,12 +108,9 @@ def generate_image(
     model.eval()
     predicted = model(input.unsqueeze(0))  # add a batch dimension
     model.train()
-    if is_lab:
-        predicted_np = lab_to_rgb_np(input, predicted.squeeze())
-        target_np = lab_to_rgb_np(input, target)
-    else:
-        target_np = target.permute(1, 2, 0).cpu().detach().numpy()
-        predicted_np = predicted.squeeze().permute(1, 2, 0).cpu().detach().numpy()
+
+    target_np = target.permute(1, 2, 0).cpu().detach().numpy()
+    predicted_np = predicted.squeeze().permute(1, 2, 0).cpu().detach().numpy()
 
     plt.figure(figsize=(10, 5))
 
@@ -154,11 +149,9 @@ def visualize_batch(
     save_path=Path("gen_images/batch"),
 ):
     model.eval()
-    generator_output_ab = model(inputs)
+    generated_imgs = model(inputs)
     model.train()
 
-    generated_imgs = lab_to_rgb_batch_np(inputs, generator_output_ab)
-    ground_truth_imgs = lab_to_rgb_batch_np(inputs, targets)
     plt.figure(figsize=(10, 5))
     for i in range(5):
         ax = plt.subplot(3, 5, i + 1)
@@ -168,7 +161,7 @@ def visualize_batch(
             ax.set_title("Grayscale", fontsize=12)
 
         ax = plt.subplot(3, 5, i + 1 + 5)
-        ax.imshow(ground_truth_imgs[i])
+        ax.imshow(targets[i].cpu())
         ax.axis("off")
         if i == 2:
             ax.set_title("Ground Truth", fontsize=12)
@@ -200,16 +193,6 @@ def train_step(
     targets: Tensor,
     device: torch.device,
 ):
-    # 1) obtain the "fake" color ab image by running L inputs through generator
-    # 2) Discriminator's turn:
-    #      - run Discriminator on generated full image (L + generated ab - detach)
-    #      - run Discriminator on real full image (concat inputs with targets)
-    #      - compute Discriminator loss
-    #      - backward + step with discriminator
-    # 3) Generator's turn:
-    #      - run the Discriminator on generated full iamge but don't detach (so that the generator can learn from D's judgement)
-    #      - compute Generator loss
-    #      - backward + step with generator
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         generator_output = G(inputs)  # 2 channels ab
 
@@ -271,8 +254,8 @@ def valid_step(
         G_total_loss = G_loss + G_L1_loss
 
     if epoch % 20 == 0:
-        pred_RGB = lab_to_rgb_batch_np(inputs, generator_output) * 255
-        ref_RGB = lab_to_rgb_batch_np(inputs, targets) * 255
+        pred_RGB = generator_output * 255
+        ref_RGB = targets * 255
         dssim_score = 0
         for ref_img, pred_img in zip(ref_RGB, pred_RGB):
             dssim_score += dssim(ref_img.astype(np.uint8), pred_img.astype(np.uint8))
@@ -438,7 +421,7 @@ def training(dataset_path: Path) -> None:
 
     torch.set_float32_matmul_precision("high")
 
-    D = Discriminator(3).to(device)
+    D = Discriminator(6).to(device)
     G = Generator().to(device)
 
     # D, G = (

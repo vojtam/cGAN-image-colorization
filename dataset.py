@@ -43,8 +43,7 @@ class ImageDataset(Dataset[Tensor]):
             img_rgb = transformed["rgb_image"]
         img_gray = img_gray / 255
         img_rgb = img_rgb / 255
-        L, ab = rgb_to_lab(img_rgb)
-        return L, ab
+        return img_gray, img_rgb
 
 
 class WrappedDataLoader:
