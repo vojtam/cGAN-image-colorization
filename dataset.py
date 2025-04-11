@@ -28,20 +28,22 @@ class ImageDataset(Dataset[Tensor]):
         return len(self.img_paths_df)
 
     def __getitem__(self, idx: int) -> Tensor:
-        img_gray_path = self.img_paths_df[idx]["img_gray_path"].item()
+        # img_gray_path = self.img_paths_df[idx]["img_gray_path"].item()
         img_rgb_path = self.img_paths_df[idx]["img_rgb_path"].item()
 
-        img_gray = pil_to_tensor(Image.open(img_gray_path))
+        # img_gray = pil_to_tensor(Image.open(img_gray_path))
         img_rgb = pil_to_tensor(Image.open(img_rgb_path))
 
         if self.transform is not None:
-            img_gray = img_gray.permute(1, 2, 0).numpy()
+            # img_gray = img_gray.permute(1, 2, 0).numpy()
             img_rgb = img_rgb.permute(1, 2, 0).numpy()
 
-            transformed = self.transform(image=img_gray, rgb_image=img_rgb)
-            img_gray = transformed["image"]
-            img_rgb = transformed["rgb_image"]
-        img_gray = img_gray / 255
+            # transformed = self.transform(image=img_gray, rgb_image=img_rgb)
+            transformed = self.transform(image=img_rgb)
+            # img_gray = transformed["image"]
+            # img_rgb = transformed["rgb_image"]
+            img_rgb = transformed["image"]
+        # img_gray = img_gray / 255
         img_rgb = img_rgb / 255
         L, ab = rgb_to_lab(img_rgb)
         return L, ab
@@ -72,7 +74,7 @@ def get_train_transforms():
             # A.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
             ToTensorV2(),
         ],
-        additional_targets={"rgb_image": "image"},
+        # additional_targets={"rgb_image": "image"},
     )
     return train_transform
 

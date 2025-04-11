@@ -52,7 +52,7 @@ class config:
     G_lr: float = 0.0002
     D_lr: float = 0.0002
     batch_size: int = 128
-    LAMBDA: int = 80
+    LAMBDA: int = 10
     momentum_betas: tuple[float, float] = (0.5, 0.999)
     epoch_num: int = 300
 
@@ -410,7 +410,7 @@ def training(dataset_path: Path) -> None:
     print("Starting mlflow")
     # Create a new MLflow Experiment
 
-    run_name = "condGAN_12_300_epoch"
+    run_name = "condGAN_13_300_epoch"
     mlflow.set_experiment("Colorization_01")
 
     try:
