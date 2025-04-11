@@ -49,10 +49,10 @@ L1Loss = torch.nn.L1Loss()
 
 @dataclass
 class config:
-    G_lr: float = 0.0001
-    D_lr: float = 0.00001
+    G_lr: float = 0.0002
+    D_lr: float = 0.0002
     batch_size: int = 128
-    LAMBDA: int = 100
+    LAMBDA: int = 80
     momentum_betas: tuple[float, float] = (0.5, 0.999)
     epoch_num: int = 300
 
@@ -94,6 +94,7 @@ class FitStepResult:
     dssim: float = 0.0
 
 
+@torch.no_grad
 def generate_image(
     model: Generator,
     input: Tensor,
@@ -102,11 +103,13 @@ def generate_image(
     is_lab: bool = True,
     plot_subtitle: str = "",
     save: bool = True,
+    save_path=Path("gen_images/single"),
 ):
     # input has a shape C x H x W
     # target has a shape C x H x W
+    model.eval()
     predicted = model(input.unsqueeze(0))  # add a batch dimension
-
+    model.train()
     if is_lab:
         predicted_np = lab_to_rgb_np(input, predicted.squeeze())
         target_np = lab_to_rgb_np(input, target)
@@ -132,7 +135,8 @@ def generate_image(
     plt.suptitle(plot_subtitle)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     if save:
-        path = f"gen_images/generated_image_{epoch}.png"
+        save_path.mkdir(exist_ok=True)
+        path = save_path / f"generated_image_{epoch}.png"
         print(f"Sample colorized image saved to {path}")
         plt.savefig(path)
         plt.close()
@@ -140,7 +144,54 @@ def generate_image(
         plt.show()
 
 
-def fit_step(
+@torch.no_grad
+def visualize_batch(
+    model: Generator,
+    inputs: Tensor,
+    targets: Tensor,
+    epoch: int,
+    save=True,
+    save_path=Path("gen_images/batch"),
+):
+    model.eval()
+    generator_output_ab = model(inputs)
+    model.train()
+
+    generated_imgs = lab_to_rgb_batch_np(inputs, generator_output_ab)
+    ground_truth_imgs = lab_to_rgb_batch_np(inputs, targets)
+    plt.figure(figsize=(10, 5))
+    for i in range(5):
+        ax = plt.subplot(3, 5, i + 1)
+        ax.imshow(inputs[i][0].cpu(), cmap="gray")
+        ax.axis("off")
+        if i == 2:
+            ax.set_title("Grayscale", fontsize=12)
+
+        ax = plt.subplot(3, 5, i + 1 + 5)
+        ax.imshow(ground_truth_imgs[i])
+        ax.axis("off")
+        if i == 2:
+            ax.set_title("Ground Truth", fontsize=12)
+
+        ax = plt.subplot(3, 5, i + 1 + 10)
+        ax.imshow(generated_imgs[i])
+        ax.axis("off")
+        if i == 2:
+            ax.set_title("Generated", fontsize=12)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+    if save:
+        save_path.mkdir(exist_ok=True)
+        path = save_path / f"generated_images_{epoch}.png"
+        print(f"Sample colorized image saved to {path}")
+        plt.savefig(path)
+        plt.close()
+    else:
+        plt.show()
+
+
+def train_step(
     G: Generator,
     D: Discriminator,
     optimizer_G: Optimizer | None,
@@ -149,6 +200,16 @@ def fit_step(
     targets: Tensor,
     device: torch.device,
 ):
+    # 1) obtain the "fake" color ab image by running L inputs through generator
+    # 2) Discriminator's turn:
+    #      - run Discriminator on generated full image (L + generated ab - detach)
+    #      - run Discriminator on real full image (concat inputs with targets)
+    #      - compute Discriminator loss
+    #      - backward + step with discriminator
+    # 3) Generator's turn:
+    #      - run the Discriminator on generated full iamge but don't detach (so that the generator can learn from D's judgement)
+    #      - compute Generator loss
+    #      - backward + step with generator
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         generator_output = G(inputs)  # 2 channels ab
 
@@ -187,7 +248,6 @@ def valid_step(
     targets: Tensor,
     device: torch.device,
     epoch: int,
-    LAMBDA: int = 100,
 ):
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         generator_output = G(inputs)  # 2 channels ab
@@ -230,8 +290,6 @@ def fit(
     val_dataloader: DataLoader,
     optimizer_G: Optimizer,
     optimizer_D: Optimizer,
-    input_to_vizu: Tensor,
-    target_to_vizu: Tensor,
     device: torch.device,
 ) -> tuple[list[float], list[float]]:
     G_train_losses: list[float] = []
@@ -254,7 +312,7 @@ def fit(
 
         for inputs, targets in tqdm(train_dataloader):
             # torch.compiler.cudagraph_mark_step_begin()
-            step_result = fit_step(
+            step_result = train_step(
                 G,
                 D,
                 optimizer_G,
@@ -273,6 +331,7 @@ def fit(
         D_train_losses.append(train_D_loss / n_train_batches)
         L1_train_losses.append(train_L1_loss / n_train_batches)
 
+        # VALIDATION
         G.eval()
         D.eval()
 
@@ -282,23 +341,21 @@ def fit(
         dssim = 0.0
         n_val_batches = len(val_dataloader)
 
-        with torch.no_grad():
-            for inputs, targets in tqdm(val_dataloader):
-                # torch.compiler.cudagraph_mark_step_begin()
-                step_result = valid_step(
-                    G,
-                    D,
-                    inputs,
-                    targets,
-                    device,
-                    epoch,
-                    100,
-                )
+        for inputs, targets in tqdm(val_dataloader):
+            # torch.compiler.cudagraph_mark_step_begin()
+            step_result = valid_step(
+                G,
+                D,
+                inputs,
+                targets,
+                device,
+                epoch,
+            )
 
-                val_G_loss += step_result.total_G_loss.item()
-                val_D_loss += step_result.D_loss.item()
-                val_L1_loss += step_result.G_l1_loss.item()
-                dssim += step_result.dssim
+            val_G_loss += step_result.total_G_loss.item()
+            val_D_loss += step_result.D_loss.item()
+            val_L1_loss += step_result.G_l1_loss.item()
+            dssim += step_result.dssim
 
         G_val_losses.append(val_G_loss / n_val_batches)
         D_val_losses.append(val_D_loss / n_val_batches)
@@ -326,8 +383,8 @@ def fit(
             avg_dssim = dssim / n_val_batches
             print(f"average dssim score : {avg_dssim}")
             mlflow.log_metric("val_dssim", avg_dssim, step=epoch)
-
-        generate_image(G, input_to_vizu, target_to_vizu, epoch, f"epoch: {epoch}")
+        visualize_batch(G, inputs, targets, epoch)
+        generate_image(G, inputs[0], targets[0], epoch, f"epoch: {epoch}")
     print("Training finished!")
     return G_train_losses, D_train_losses
 
@@ -353,7 +410,7 @@ def training(dataset_path: Path) -> None:
     print("Starting mlflow")
     # Create a new MLflow Experiment
 
-    run_name = "condGAN_08_300_epoch"
+    run_name = "condGAN_12_300_epoch"
     mlflow.set_experiment("Colorization_01")
 
     try:
@@ -364,10 +421,13 @@ def training(dataset_path: Path) -> None:
 
     img_paths_df = get_image_paths_df(dataset_path)
 
-    train_dataset, val_dataset, _ = split_dataset(img_paths_df, 0.15, 0.1)
+    train_dataset, val_dataset, _ = split_dataset(img_paths_df, 0.10, 0.1)
 
     train_dataloader = WrappedDataLoader(
-        DataLoader(train_dataset, batch_size=config.batch_size, num_workers=10), device
+        DataLoader(
+            train_dataset, shuffle=True, batch_size=config.batch_size, num_workers=10
+        ),
+        device,
     )
     val_dataloader = WrappedDataLoader(
         DataLoader(
@@ -397,8 +457,6 @@ def training(dataset_path: Path) -> None:
         val_dataloader,
         optimizer_G,
         optimizer_D,
-        val_dataset[0][0].to(device),
-        val_dataset[0][1].to(device),
         device,
     )
 
