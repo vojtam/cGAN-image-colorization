@@ -104,16 +104,23 @@ class Discriminator(nn.Module):
         super().__init__()
         # Ck = Convolution-BatchNorm-ReLU
         # discriminator: C64-C128-C256-C512 -> classification head (sigmoid)
-        self.layers = nn.Sequential(
-            DownBlock(input_channels, 64, False),
-            DownBlock(64, 128),
-            DownBlock(128, 256),
-            DownBlock(256, 512, stride=1),
-            nn.Conv2d(512, 1, kernel_size=(4, 4), stride=1, padding=1),
+        layers = nn.ModuleList(
+            [
+                DownBlock(input_channels, 64, False),
+                DownBlock(64, 128),
+                DownBlock(128, 256),
+                DownBlock(256, 512, stride=1),
+                nn.Conv2d(512, 1, kernel_size=(4, 4), stride=1, padding=1),
+            ]
         )
 
+        for layer in layers[:-1]:
+            nn.utils.parametrizations.spectral_norm(layer.downsample[0])
+        nn.utils.parametrizations.spectral_norm(layers[-1])
+        self.discriminator_layers = nn.Sequential(*layers)
+
     def forward(self, x: Tensor) -> Tensor:
-        x = self.layers(x)
+        x = self.discriminator_layers(x)
         return x
 
 
