@@ -23,8 +23,6 @@ from tqdm import tqdm
 from dataset import (
     WrappedDataLoader,
     get_image_paths_df,
-    lab_to_rgb_batch_np,
-    lab_to_rgb_np,
     split_dataset,
 )
 from evaluation import dssim
@@ -49,10 +47,10 @@ L1Loss = torch.nn.L1Loss()
 
 @dataclass
 class config:
-    G_lr: float = 0.0002
-    D_lr: float = 0.0002
-    batch_size: int = 128
-    LAMBDA: int = 10
+    G_lr: float = 0.0005
+    D_lr: float = 0.000001
+    batch_size: int = 64
+    LAMBDA: int = 80
     momentum_betas: tuple[float, float] = (0.5, 0.999)
     epoch_num: int = 300
 
@@ -94,13 +92,16 @@ class FitStepResult:
     dssim: float = 0.0
 
 
+def scale_to_zero_one(image_np):
+    return (image_np - image_np.min()) / (image_np.max() - image_np.min())
+
+
 @torch.no_grad
 def generate_image(
     model: Generator,
     input: Tensor,
     target: Tensor,
     epoch: int,
-    is_lab: bool = True,
     plot_subtitle: str = "",
     save: bool = True,
     save_path=Path("gen_images/single"),
@@ -110,16 +111,21 @@ def generate_image(
     model.eval()
     predicted = model(input.unsqueeze(0))  # add a batch dimension
     model.train()
-    if is_lab:
-        predicted_np = lab_to_rgb_np(input, predicted.squeeze())
-        target_np = lab_to_rgb_np(input, target)
-    else:
-        target_np = target.permute(1, 2, 0).cpu().detach().numpy()
-        predicted_np = predicted.squeeze().permute(1, 2, 0).cpu().detach().numpy()
+    target_np = target.permute(1, 2, 0).cpu().detach().numpy()
+    predicted_np = predicted.squeeze().permute(1, 2, 0).cpu().detach().numpy()
+    input_np = input.permute(1, 2, 0).cpu().detach().numpy()
+
+    if input_np.min() < 0 or input_np.max() > 1:
+        input_np = scale_to_zero_one(input_np)
+
+    if target_np.min() < 0 or target_np.max() > 1:
+        target_np = scale_to_zero_one(target_np)
+
+    if predicted_np.min() < 0 or predicted_np.max() > 1:
+        predicted_np = scale_to_zero_one(predicted_np)
 
     plt.figure(figsize=(10, 5))
 
-    input_np = input.permute(1, 2, 0).cpu().detach().numpy()
     display_list = [input_np, target_np, predicted_np]
     title = ["Input Image", "Ground Truth", "Predicted Image"]
 
@@ -154,21 +160,30 @@ def visualize_batch(
     save_path=Path("gen_images/batch"),
 ):
     model.eval()
-    generator_output_ab = model(inputs)
+    generated_imgs = model(inputs).cpu().permute(0, 2, 3, 1).numpy()
     model.train()
+    grayscale = inputs.cpu().permute(0, 2, 3, 1).numpy()
+    ground_truth = targets.cpu().permute(0, 2, 3, 1).numpy()
 
-    generated_imgs = lab_to_rgb_batch_np(inputs, generator_output_ab)
-    ground_truth_imgs = lab_to_rgb_batch_np(inputs, targets)
+    if grayscale.min() < 0 or grayscale.max() > 1:
+        grayscale = scale_to_zero_one(grayscale)
+
+    if ground_truth.min() < 0 or ground_truth.max() > 1:
+        ground_truth = scale_to_zero_one(ground_truth)
+
+    if generated_imgs.min() < 0 or generated_imgs.max() > 1:
+        generated_imgs = scale_to_zero_one(generated_imgs)
+
     plt.figure(figsize=(10, 5))
     for i in range(5):
         ax = plt.subplot(3, 5, i + 1)
-        ax.imshow(inputs[i][0].cpu(), cmap="gray")
+        ax.imshow(grayscale[i], cmap="gray")
         ax.axis("off")
         if i == 2:
             ax.set_title("Grayscale", fontsize=12)
 
         ax = plt.subplot(3, 5, i + 1 + 5)
-        ax.imshow(ground_truth_imgs[i])
+        ax.imshow(ground_truth[i])
         ax.axis("off")
         if i == 2:
             ax.set_title("Ground Truth", fontsize=12)
@@ -200,33 +215,23 @@ def train_step(
     targets: Tensor,
     device: torch.device,
 ):
-    # 1) obtain the "fake" color ab image by running L inputs through generator
-    # 2) Discriminator's turn:
-    #      - run Discriminator on generated full image (L + generated ab - detach)
-    #      - run Discriminator on real full image (concat inputs with targets)
-    #      - compute Discriminator loss
-    #      - backward + step with discriminator
-    # 3) Generator's turn:
-    #      - run the Discriminator on generated full iamge but don't detach (so that the generator can learn from D's judgement)
-    #      - compute Generator loss
-    #      - backward + step with generator
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        generator_output = G(inputs)  # 2 channels ab
+        generator_output = G(inputs)  #
 
         generated = torch.concat(
             (inputs, generator_output.detach()), dim=1
-        )  # L + ab # Note to self: need to use detach here to keep the computational graphs separate -> otherwise backprop would break
+        )  # Note to self: need to use detach here to keep the computational graphs separate -> otherwise backprop would break
         real = torch.concat((inputs, targets), dim=1)
         discriminator_generated_output = D(generated)
         discriminator_real_output = D(real)
 
     D_loss = discriminator_loss(
-        discriminator_generated_output, discriminator_real_output
+        discriminator_generated_output, discriminator_real_output, smoothing_factor=0.9
     )
-
     optimizer_D.zero_grad()
-    D_loss.backward()
-    optimizer_D.step()
+    if random.random() > 0.7:
+        D_loss.backward()
+        optimizer_D.step()
 
     G_fake = torch.concat((inputs, generator_output), dim=1)
     D_fake_output = D(G_fake)
@@ -250,7 +255,7 @@ def valid_step(
     epoch: int,
 ):
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        generator_output = G(inputs)  # 2 channels ab
+        generator_output = G(inputs)
 
         generated = torch.cat((inputs, generator_output), dim=1)
         real = torch.cat((inputs, targets), dim=1)
@@ -271,8 +276,13 @@ def valid_step(
         G_total_loss = G_loss + G_L1_loss
 
     if epoch % 20 == 0:
-        pred_RGB = lab_to_rgb_batch_np(inputs, generator_output) * 255
-        ref_RGB = lab_to_rgb_batch_np(inputs, targets) * 255
+        pred_RGB = (
+            scale_to_zero_one(
+                generator_output.cpu().to(torch.float32).permute(0, 2, 3, 1).numpy()
+            )
+            * 255
+        )
+        ref_RGB = scale_to_zero_one(targets.cpu().permute(0, 2, 3, 1).numpy()) * 255
         dssim_score = 0
         for ref_img, pred_img in zip(ref_RGB, pred_RGB):
             dssim_score += dssim(ref_img.astype(np.uint8), pred_img.astype(np.uint8))
@@ -310,8 +320,9 @@ def fit(
         train_D_loss = 0.0
         train_L1_loss = 0.0
 
+        n_batches = 0
         for inputs, targets in tqdm(train_dataloader):
-            # torch.compiler.cudagraph_mark_step_begin()
+            n_batches += 1
             step_result = train_step(
                 G,
                 D,
@@ -322,14 +333,13 @@ def fit(
                 device,
             )
 
-            train_G_loss += step_result.total_G_loss.item()
+            train_G_loss += step_result.G_loss.item()
             train_D_loss += step_result.D_loss.item()
             train_L1_loss += step_result.G_l1_loss.item()
 
-        n_train_batches = len(train_dataloader)
-        G_train_losses.append(train_G_loss / n_train_batches)
-        D_train_losses.append(train_D_loss / n_train_batches)
-        L1_train_losses.append(train_L1_loss / n_train_batches)
+        G_train_losses.append(train_G_loss / n_batches)
+        D_train_losses.append(train_D_loss / n_batches)
+        L1_train_losses.append(train_L1_loss / n_batches)
 
         # VALIDATION
         G.eval()
@@ -339,10 +349,9 @@ def fit(
         val_D_loss = 0.0
         val_L1_loss = 0.0
         dssim = 0.0
-        n_val_batches = len(val_dataloader)
-
+        n_batches = 0
         for inputs, targets in tqdm(val_dataloader):
-            # torch.compiler.cudagraph_mark_step_begin()
+            n_batches += 1
             step_result = valid_step(
                 G,
                 D,
@@ -352,14 +361,14 @@ def fit(
                 epoch,
             )
 
-            val_G_loss += step_result.total_G_loss.item()
+            val_G_loss += step_result.G_loss.item()
             val_D_loss += step_result.D_loss.item()
             val_L1_loss += step_result.G_l1_loss.item()
             dssim += step_result.dssim
 
-        G_val_losses.append(val_G_loss / n_val_batches)
-        D_val_losses.append(val_D_loss / n_val_batches)
-        L1_val_losses.append(val_L1_loss / n_val_batches)
+        G_val_losses.append(val_G_loss / n_batches)
+        D_val_losses.append(val_D_loss / n_batches)
+        L1_val_losses.append(val_L1_loss / n_batches)
 
         torch.cuda.synchronize()
         epoch_end_time = time.time()
@@ -380,7 +389,7 @@ def fit(
             sep="\n",
         )
         if epoch % 20 == 0:
-            avg_dssim = dssim / n_val_batches
+            avg_dssim = dssim / n_batches
             print(f"average dssim score : {avg_dssim}")
             mlflow.log_metric("val_dssim", avg_dssim, step=epoch)
         visualize_batch(G, inputs, targets, epoch)
@@ -410,7 +419,7 @@ def training(dataset_path: Path) -> None:
     print("Starting mlflow")
     # Create a new MLflow Experiment
 
-    run_name = "condGAN_13_300_epoch"
+    run_name = "condGAN_20_RGB_300_epoch"
     mlflow.set_experiment("Colorization_01")
 
     try:
@@ -419,7 +428,7 @@ def training(dataset_path: Path) -> None:
         mlflow.end_run()
         mlflow.start_run()
 
-    img_paths_df = get_image_paths_df(dataset_path)
+    img_paths_df = get_image_paths_df(dataset_path, 600)
 
     train_dataset, val_dataset, _ = split_dataset(img_paths_df, 0.10, 0.1)
 
@@ -438,13 +447,8 @@ def training(dataset_path: Path) -> None:
 
     torch.set_float32_matmul_precision("high")
 
-    D = Discriminator(3).to(device)
+    D = Discriminator(6).to(device)
     G = Generator().to(device)
-
-    # D, G = (
-    #     torch.compile(D, mode="reduce-overhead"),
-    #     torch.compile(G, mode="reduce-overhead"),
-    # )
 
     optimizer_G = Adam(G.parameters(), lr=config.G_lr, betas=config.momentum_betas)
     optimizer_D = Adam(D.parameters(), lr=config.D_lr, betas=config.momentum_betas)

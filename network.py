@@ -27,7 +27,7 @@ def generator_loss(
 def discriminator_loss(
     discriminator_generated_output: Tensor,
     discriminator_real_output: Tensor,
-    smoothing_factor: float | None = 0.9,
+    smoothing_factor: float | None = None,
 ):
     fake_labels = torch.zeros_like(discriminator_generated_output, requires_grad=False)
     real_labels = torch.ones_like(discriminator_real_output, requires_grad=False)
@@ -37,7 +37,7 @@ def discriminator_loss(
     D_fake_loss = BCELogitsLoss(discriminator_generated_output, fake_labels)
     D_real_loss = BCELogitsLoss(discriminator_real_output, real_labels)
 
-    D_loss = D_fake_loss + D_real_loss
+    D_loss = (D_fake_loss + D_real_loss) / 2
     return D_loss
 
 
@@ -47,7 +47,7 @@ class Generator(nn.Module):
 
         # Each block in the encoder is: Convolution -> Batch normalization -> Leaky ReLU
 
-        down_filters = [1, 64, 64, 128, 256, 256, 512]
+        down_filters = [3, 64, 64, 128, 256, 256, 512]
         use_batch_norm = [False, False, True, True, True, True, False]
 
         self.down_layers = nn.ModuleList(
@@ -74,7 +74,7 @@ class Generator(nn.Module):
         self.output_layer = nn.Sequential(
             nn.ConvTranspose2d(
                 in_channels=up_filters[-1] * 2,
-                out_channels=2,
+                out_channels=3,
                 kernel_size=(4, 4),
                 stride=2,
                 padding=1,
@@ -109,8 +109,8 @@ class Discriminator(nn.Module):
                 DownBlock(input_channels, 64, False),
                 DownBlock(64, 128),
                 DownBlock(128, 256),
-                DownBlock(256, 512, stride=1),
-                nn.Conv2d(512, 1, kernel_size=(4, 4), stride=1, padding=1),
+                # DownBlock(256, 512, stride=1),
+                nn.Conv2d(256, 1, kernel_size=(4, 4), stride=1, padding=1),
             ]
         )
 
