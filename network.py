@@ -7,8 +7,89 @@
 import torch
 from torch import Tensor, nn
 
-BCELogitsLoss = nn.BCEWithLogitsLoss()
-L1Loss = torch.nn.L1Loss()
+BCELogitsLoss = nn.BCEWithLogitsLoss(reduction="mean")
+L1Loss = torch.nn.L1Loss(reduction="mean")
+
+from torch.autograd import grad
+
+
+# attribution: https://discuss.pytorch.org/t/wgan-gradient-penalty-error-even-with-retain-graph-true/113266
+def compute_gradient_penalty(
+    critic: nn.Module,
+    real_samples: Tensor,
+    fake_samples: Tensor,
+    device: torch.device,
+    lambda_gp: float = 10.0,
+) -> Tensor:
+    """Calculates the gradient penalty loss for WGAN GP"""
+    # Random weight term for interpolation between real and fake samples
+    # Shape: (batch_size, 1, 1, 1) to broadcast correctly
+    alpha = torch.rand(
+        (real_samples.size(0), 1, 1, 1), device=device, requires_grad=False
+    )
+
+    # Get random interpolation between real and fake samples
+    # Shape: (batch_size, channels, height, width)
+    interpolated_images = (
+        alpha * real_samples + ((1 - alpha) * fake_samples)
+    ).requires_grad_(True)
+
+    critic_score_interpolated = critic(interpolated_images)  # logits
+
+    # Use fake gradients (batch of ones) for backprop, matching the critic output shape
+    fake_grad_outputs = torch.ones_like(
+        critic_score_interpolated, requires_grad=False, device=device
+    )
+
+    gradients = grad(
+        outputs=critic_score_interpolated,
+        inputs=interpolated_images,
+        grad_outputs=fake_grad_outputs,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]  # grad returns a tuple, we only need the gradient w.r.t. interpolates
+
+    gradients = gradients.view(gradients.size(0), -1)
+
+    # Calculate the norm and the penalty
+    # Add small epsilon for stability if needed, though norm usually handles it
+    gradient_norm = gradients.norm(2, dim=1)  # L2 norm for each sample in batch
+    gradient_penalty = (
+        (gradient_norm - 1) ** 2
+    ).mean()  # Mean squared difference from 1
+
+    return lambda_gp * gradient_penalty  # Scale by lambda_gp
+
+
+def critic_loss_wgan(critic_real_output: Tensor, critic_fake_output: Tensor) -> Tensor:
+    """
+    Calculates the base WGAN critic loss.
+    Note: Gradient penalty is added separately.
+    """
+    # We want to maximize D(real) - D(fake) which is equivalent to minimizing D(fake) - D(real)
+    loss_c = torch.mean(critic_fake_output) - torch.mean(critic_real_output)
+    return loss_c
+
+
+def generator_loss_wgan(
+    critic_fake_output: Tensor,  # logits of the discriminator on the cat(inputs_L, generated_ab)
+    generator_output: Tensor,
+    targets: Tensor,
+    lambda_l1: int = 100,
+) -> tuple[Tensor, Tensor]:
+    """
+    Calculates the WGAN generator loss components.
+    - Adversarial loss: Maximize D(fake) -> Minimize -D(fake)
+    Returns the total loss for the generator and the L1 component separately.
+    """
+    # Adversarial Loss: We want critic to output high values for fake images
+    adversarial_loss_g = -torch.mean(critic_fake_output)
+
+    # L1 Loss (same as before)
+    l1_loss_g = L1Loss(generator_output, targets) * lambda_l1
+
+    return adversarial_loss_g, l1_loss_g
 
 
 def generator_loss(
@@ -34,7 +115,10 @@ def discriminator_loss(
     if smoothing_factor is not None:
         real_labels *= smoothing_factor
 
-    D_fake_loss = BCELogitsLoss(discriminator_generated_output, fake_labels)
+    D_fake_loss = BCELogitsLoss(
+        discriminator_generated_output,
+        fake_labels,
+    )
     D_real_loss = BCELogitsLoss(discriminator_real_output, real_labels)
 
     D_loss = D_fake_loss + D_real_loss
@@ -107,9 +191,9 @@ class Discriminator(nn.Module):
         layers = nn.ModuleList(
             [
                 DownBlock(input_channels, 64, False),
-                DownBlock(64, 128),
-                DownBlock(128, 256),
-                DownBlock(256, 512, stride=1),
+                DownBlock(64, 128, False, False),
+                DownBlock(128, 256, False, False),
+                DownBlock(256, 512, False, False, stride=1),
                 nn.Conv2d(512, 1, kernel_size=(4, 4), stride=1, padding=1),
             ]
         )
@@ -130,6 +214,7 @@ class DownBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         batch_norm: bool = True,
+        instance_norm: bool = False,
         stride: int = 2,
     ) -> None:
         super().__init__()
@@ -146,6 +231,8 @@ class DownBlock(nn.Module):
 
         if batch_norm:
             layers.append(nn.BatchNorm2d(out_channels))
+        elif instance_norm:
+            layers.append(nn.InstanceNorm2d(out_channels))
         layers.append(nn.LeakyReLU(0.2))
         self.downsample = nn.Sequential(*layers)
 

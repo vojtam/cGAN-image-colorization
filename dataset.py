@@ -15,7 +15,8 @@ from skimage.color import lab2rgb, rgb2lab
 from sklearn.model_selection import train_test_split
 from torch import Tensor, from_numpy
 from torch.utils.data import Dataset
-from torchvision.transforms.functional import pil_to_tensor
+from torchvision.transforms import ToTensor
+from tqdm import tqdm
 
 
 class ImageDataset(Dataset[Tensor]):
@@ -31,8 +32,9 @@ class ImageDataset(Dataset[Tensor]):
         # img_gray_path = self.img_paths_df[idx]["img_gray_path"].item()
         img_rgb_path = self.img_paths_df[idx]["img_rgb_path"].item()
 
-        # img_gray = pil_to_tensor(Image.open(img_gray_path))
-        img_rgb = pil_to_tensor(Image.open(img_rgb_path))
+        # img_gray = pil_to_tensor(Image.open(img_gray_path)) / 255
+        img_rgb = Image.open(img_rgb_path).convert("RGB")
+        img_rgb = ToTensor()(img_rgb)
 
         if self.transform is not None:
             # img_gray = img_gray.permute(1, 2, 0).numpy()
@@ -43,8 +45,6 @@ class ImageDataset(Dataset[Tensor]):
             # img_gray = transformed["image"]
             # img_rgb = transformed["rgb_image"]
             img_rgb = transformed["image"]
-        # img_gray = img_gray / 255
-        img_rgb = img_rgb / 255
         L, ab = rgb_to_lab(img_rgb)
         return L, ab
 
@@ -63,15 +63,37 @@ class WrappedDataLoader:
             yield x.to(self.device), y.to(self.device)
 
 
-def get_train_transforms():
+def get_dataset_stats(ds):
+    images = torch.stack([im for im in tqdm(ds)])  # done on rgb images
+
+    ds_mean = images.mean(dim=(0, 2, 3))
+    ds_std = images.std(dim=(0, 2, 3))
+
+    return ds_mean.tolist(), ds_std.tolist()
+
+
+def get_train_transforms(mean, std):
     train_transform = A.Compose(
         [
             A.Resize(600, 420),
             A.RandomCrop(512, 384),  # 4x3
             A.HorizontalFlip(p=0.5),
             A.Rotate(limit=30.0, p=0.5),
-            A.ColorJitter(p=0.6),
-            # A.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2, p=0.4),
+            # A.Normalize(mean=mean, std=std),
+            ToTensorV2(),
+        ],
+        # additional_targets={"rgb_image": "image"},
+    )
+    return train_transform
+
+
+def get_val_transforms(mean, std):
+    train_transform = A.Compose(
+        [
+            A.Resize(600, 420),
+            A.RandomCrop(512, 384),  # 4x3
+            # A.Normalize(mean=mean, std=std),
             ToTensorV2(),
         ],
         # additional_targets={"rgb_image": "image"},
@@ -85,14 +107,18 @@ def split_dataset(
     train_df, test_df = train_test_split(img_path_df, test_size=test_size)
     train_df, valid_df = train_test_split(train_df, test_size=val_size)
 
-    train_dataset = ImageDataset(train_df, get_train_transforms())
-    val_dataset = ImageDataset(valid_df)
-    test_dataset = ImageDataset(test_df)
+    # mean, std = get_dataset_stats(ImageDataset(train_df))
+    mean = [0.3574, 0.2599, 0.3042]
+    std = [0.2055, 0.1755, 0.1960]
+
+    train_dataset = ImageDataset(train_df, get_train_transforms(mean, std))
+    val_dataset = ImageDataset(valid_df, get_val_transforms(mean, std))
+    test_dataset = ImageDataset(test_df, get_val_transforms(mean, std))
 
     return (train_dataset, val_dataset, test_dataset)
 
 
-def get_image_paths_df(dataset_path: Path, n: int | None = None) -> list[str]:
+def get_train_image_paths_df(dataset_path: Path, n: int | None = None) -> list[str]:
     img_gray_paths = []
     img_rgb_paths = []
     for dir in (dataset_path / "img_gray").iterdir():
@@ -117,6 +143,14 @@ def get_image_paths_df(dataset_path: Path, n: int | None = None) -> list[str]:
     return DataFrame({"img_gray_path": img_gray_paths, "img_rgb_path": img_rgb_paths})
 
 
+def get_image_paths_df(dataset_path: Path, extension=".jpg", n: int | None = None):
+    if n is not None:
+        return DataFrame(
+            {"img_rgb_path": list(dataset_path.rglob(f"*{extension}"))[:n]}
+        )
+    return DataFrame({"img_rgb_path": list(dataset_path.rglob(f"*{extension}"))})
+
+
 def rgb_to_lab(img_rgb: Tensor):
     img_lab = rgb2lab(img_rgb.permute(1, 2, 0).numpy()).astype("float32")
     img_lab = from_numpy(img_lab).permute(2, 0, 1)
@@ -136,7 +170,7 @@ def lab_to_rgb_np(L: Tensor, ab: Tensor) -> np.array:
 
 
 def lab_to_rgb_torch(L: Tensor, ab: Tensor) -> Tensor:
-    rgb_torch = torch.from_numpy(lab_to_rgb_batch_np(L, ab)).permute(2, 0, 1)
+    rgb_torch = torch.from_numpy(lab_to_rgb_np(L, ab)).permute(2, 0, 1)
     return rgb_torch
 
 

@@ -15,20 +15,26 @@ import mlflow
 import numpy as np
 import torch
 from torch import Tensor, nn
-from torch.optim import Adam, Optimizer
+from torch.optim import Adam, Optimizer, RMSprop
 from torch.utils.data import DataLoader
 from torchview import draw_graph
 from tqdm import tqdm
 
 from dataset import (
     WrappedDataLoader,
-    get_image_paths_df,
+    get_train_image_paths_df,
     lab_to_rgb_batch_np,
     lab_to_rgb_np,
     split_dataset,
 )
-from evaluation import dssim
-from network import Discriminator, Generator, discriminator_loss, generator_loss
+from network import (
+    Discriminator,
+    Generator,
+    compute_gradient_penalty,
+    discriminator_loss,
+    generator_loss,
+    generator_loss_wgan,
+)
 
 
 def set_global_random_seed(seed):
@@ -49,12 +55,12 @@ L1Loss = torch.nn.L1Loss()
 
 @dataclass
 class config:
-    G_lr: float = 0.0002
-    D_lr: float = 0.0002
-    batch_size: int = 128
+    G_lr: float = 0.00005
+    D_lr: float = 0.00005
+    batch_size: int = 32
     LAMBDA: int = 10
     momentum_betas: tuple[float, float] = (0.5, 0.999)
-    epoch_num: int = 300
+    epoch_num: int = 600
 
 
 # sample function for model architecture visualization
@@ -85,13 +91,61 @@ def plot_learning_curves(
     plt.savefig("learning_curves.png")
 
 
-@dataclass
-class FitStepResult:
-    total_G_loss: float
-    G_loss: float
-    G_l1_loss: float
-    D_loss: float
-    dssim: float = 0.0
+class TrainResults:
+    def __init__(self):
+        self.G_train_losses: list[float] = []
+        self.L1_train_losses: list[float] = []
+        self.critic_real_train_losses: list[float] = []
+        self.critic_fake_train_losses: list[float] = []
+        self.grad_penalties: list[float] = []
+
+        self.train_G_loss = 0.0
+        self.train_critic_real_loss = 0.0
+        self.train_critic_fake_loss = 0.0
+        self.train_L1_loss = 0.0
+        self.train_gp = 0.0
+
+    def update_train_step(self, G_loss, crit_real_loss, crit_fake_loss, L1, grad_pen):
+        self.train_G_loss += G_loss
+        self.train_critic_real_loss += crit_real_loss
+        self.train_critic_fake_loss += crit_fake_loss
+        self.train_L1_loss += L1
+        self.train_gp += grad_pen
+
+    def _reset(self):
+        self.train_G_loss = 0.0
+        self.train_critic_real_loss = 0.0
+        self.train_critic_fake_loss = 0.0
+        self.train_L1_loss = 0.0
+        self.train_gp = 0.0
+
+    def finish_train_epoch(
+        self, epoch: int, n_batches, epoch_end_time: float, epoch_start_time: float
+    ):
+        self.G_train_losses.append(self.train_G_loss / n_batches)
+        self.L1_train_losses.append(self.train_L1_loss / n_batches)
+        self.critic_real_train_losses.append(self.train_critic_real_loss / n_batches)
+        self.critic_fake_train_losses.append(self.train_critic_fake_loss / n_batches)
+        self.grad_penalties.append(self.train_gp / n_batches)
+
+        mlflow.log_metric("train_G_loss", self.G_train_losses[-1], step=epoch)
+        mlflow.log_metric(
+            "train_critic_real_loss", self.critic_real_train_losses[-1], step=epoch
+        )
+        mlflow.log_metric(
+            "train_critic_fake_loss", self.critic_fake_train_losses[-1], step=epoch
+        )
+        mlflow.log_metric("train_L1_loss", self.L1_train_losses[-1], step=epoch)
+        mlflow.log_metric("train_gp", self.grad_penalties[-1], step=epoch)
+        mlflow.log_metric(
+            "epoch_duration", epoch_end_time - epoch_start_time, step=epoch
+        )
+        print(
+            f"Epoch: {epoch}, time_elapsed: {epoch_end_time - epoch_start_time:.2f} seconds | ",
+            f"train_G_loss: {self.G_train_losses[-1]:.3f} | train_L1_loss: {self.L1_train_losses[-1]:.3f} | critic_real_loss: {self.critic_real_train_losses[-1]:.3f} |  critic_fake_loss: {self.critic_fake_train_losses[-1]:.3f} | train_GP: {self.grad_penalties[-1]:.3f}",
+            sep="\n",
+        )
+        self._reset()
 
 
 @torch.no_grad
@@ -191,6 +245,69 @@ def visualize_batch(
         plt.show()
 
 
+def D_train_step(
+    G: Generator,
+    D: Discriminator,
+    optimizer_D: Optimizer,
+    inputs: Tensor,
+    targets: Tensor,
+    device: torch.device,
+):
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        generator_output = G(inputs)  # 2 channels ab
+
+        generated_conditional = torch.concat(
+            (inputs, generator_output.detach()), dim=1
+        )  # L + ab # Note to self: need to use detach here to keep the computational graphs separate -> otherwise backprop would break
+        real_conditional = torch.concat((inputs, targets), dim=1)
+
+        critic_generated_logits = D(generated_conditional)
+        critic_real_logits = D(real_conditional)
+
+    grad_penalty = compute_gradient_penalty(
+        D, real_conditional, generated_conditional, device, 10
+    )
+
+    critic_real_loss = -torch.mean(critic_real_logits)
+    critic_fake_loss = torch.mean(critic_generated_logits)
+    D_loss = critic_fake_loss + critic_real_loss + grad_penalty
+
+    optimizer_D.zero_grad()
+    D_loss.backward()
+    optimizer_D.step()
+
+    return (
+        generator_output,
+        critic_real_loss.cpu(),
+        critic_fake_loss.cpu(),
+        grad_penalty.cpu(),
+    )
+
+
+def G_train_step(
+    D: Discriminator,
+    generator_output: Tensor,
+    optimizer_G: Optimizer,
+    inputs: Tensor,
+    targets: Tensor,
+    device: torch.device,
+):
+    generated_conditional = torch.concat((inputs, generator_output), dim=1)
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        critic_generated_logits = D(generated_conditional)
+
+    G_loss, G_L1_loss = generator_loss_wgan(
+        critic_generated_logits, generator_output, targets, config.LAMBDA
+    )
+    G_total_loss = G_loss + G_L1_loss
+
+    optimizer_G.zero_grad()
+    G_total_loss.backward()
+    optimizer_G.step()
+
+    return G_loss.cpu(), G_L1_loss.cpu()
+
+
 def train_step(
     G: Generator,
     D: Discriminator,
@@ -198,6 +315,7 @@ def train_step(
     optimizer_D: Optimizer | None,
     inputs: Tensor,
     targets: Tensor,
+    trainResults: TrainResults,
     device: torch.device,
 ):
     # 1) obtain the "fake" color ab image by running L inputs through generator
@@ -209,35 +327,18 @@ def train_step(
     # 3) Generator's turn:
     #      - run the Discriminator on generated full iamge but don't detach (so that the generator can learn from D's judgement)
     #      - compute Generator loss
+
     #      - backward + step with generator
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        generator_output = G(inputs)  # 2 channels ab
-
-        generated = torch.concat(
-            (inputs, generator_output.detach()), dim=1
-        )  # L + ab # Note to self: need to use detach here to keep the computational graphs separate -> otherwise backprop would break
-        real = torch.concat((inputs, targets), dim=1)
-        discriminator_generated_output = D(generated)
-        discriminator_real_output = D(real)
-
-    D_loss = discriminator_loss(
-        discriminator_generated_output, discriminator_real_output
+    gen_output, critic_real_loss, critic_fake_loss, grad_penalty = D_train_step(
+        G, D, optimizer_D, inputs, targets, device
+    )
+    G_loss, G_L1_loss = G_train_step(
+        D, gen_output, optimizer_G, inputs, targets, device
     )
 
-    optimizer_D.zero_grad()
-    D_loss.backward()
-    optimizer_D.step()
-
-    G_fake = torch.concat((inputs, generator_output), dim=1)
-    D_fake_output = D(G_fake)
-    G_loss, G_L1_loss = generator_loss(D_fake_output, generator_output, targets)
-    G_total_loss = G_loss + G_L1_loss
-
-    optimizer_G.zero_grad()
-    G_total_loss.backward()
-    optimizer_G.step()
-
-    return FitStepResult(G_total_loss, G_loss, G_L1_loss, D_loss)
+    trainResults.update_train_step(
+        G_loss, critic_real_loss, critic_fake_loss, G_L1_loss, grad_penalty
+    )
 
 
 @torch.no_grad
@@ -270,16 +371,16 @@ def valid_step(
 
         G_total_loss = G_loss + G_L1_loss
 
-    if epoch % 20 == 0:
-        pred_RGB = lab_to_rgb_batch_np(inputs, generator_output) * 255
-        ref_RGB = lab_to_rgb_batch_np(inputs, targets) * 255
-        dssim_score = 0
-        for ref_img, pred_img in zip(ref_RGB, pred_RGB):
-            dssim_score += dssim(ref_img.astype(np.uint8), pred_img.astype(np.uint8))
-        dssim_score /= inputs.shape[0]
-        return FitStepResult(G_total_loss, G_loss, G_L1_loss, D_loss, dssim=dssim_score)
+    # if epoch % 20 == 0:
+    #     pred_RGB = lab_to_rgb_batch_np(inputs, generator_output) * 255
+    #     ref_RGB = lab_to_rgb_batch_np(inputs, targets) * 255
+    #     dssim_score = 0
+    #     for ref_img, pred_img in zip(ref_RGB, pred_RGB):
+    #         dssim_score += dssim(ref_img.astype(np.uint8), pred_img.astype(np.uint8))
+    #     dssim_score /= inputs.shape[0]
+    #     return FitStepResult(G_total_loss, G_loss, G_L1_loss, D_loss, dssim=dssim_score)
 
-    return FitStepResult(G_total_loss, G_loss, G_L1_loss, D_loss)
+    # return FitStepResult(G_total_loss, G_loss, G_L1_loss, D_loss)
 
 
 # sample function for training
@@ -292,13 +393,7 @@ def fit(
     optimizer_D: Optimizer,
     device: torch.device,
 ) -> tuple[list[float], list[float]]:
-    G_train_losses: list[float] = []
-    L1_train_losses: list[float] = []
-    D_train_losses: list[float] = []
-
-    G_val_losses: list[float] = []
-    L1_val_losses: list[float] = []
-    D_val_losses: list[float] = []
+    trainResults = TrainResults()
 
     for epoch in range(config.epoch_num):
         G.train()
@@ -306,87 +401,54 @@ def fit(
         torch.cuda.synchronize()
         epoch_start_time = time.time()
 
-        train_G_loss = 0.0
-        train_D_loss = 0.0
-        train_L1_loss = 0.0
-
+        n_batches = 0
         for inputs, targets in tqdm(train_dataloader):
             # torch.compiler.cudagraph_mark_step_begin()
-            step_result = train_step(
+            n_batches += 1
+            train_step(
                 G,
                 D,
                 optimizer_G,
                 optimizer_D,
                 inputs,
                 targets,
+                trainResults,
                 device,
             )
-
-            train_G_loss += step_result.total_G_loss.item()
-            train_D_loss += step_result.D_loss.item()
-            train_L1_loss += step_result.G_l1_loss.item()
-
-        n_train_batches = len(train_dataloader)
-        G_train_losses.append(train_G_loss / n_train_batches)
-        D_train_losses.append(train_D_loss / n_train_batches)
-        L1_train_losses.append(train_L1_loss / n_train_batches)
 
         # VALIDATION
         G.eval()
         D.eval()
 
-        val_G_loss = 0.0
-        val_D_loss = 0.0
-        val_L1_loss = 0.0
-        dssim = 0.0
-        n_val_batches = len(val_dataloader)
-
         for inputs, targets in tqdm(val_dataloader):
             # torch.compiler.cudagraph_mark_step_begin()
-            step_result = valid_step(
-                G,
-                D,
-                inputs,
-                targets,
-                device,
-                epoch,
-            )
+            # step_result = valid_step(
+            #     G,
+            #     D,
+            #     inputs,
+            #     targets,
+            #     device,
+            #     epoch,
+            # )
 
-            val_G_loss += step_result.total_G_loss.item()
-            val_D_loss += step_result.D_loss.item()
-            val_L1_loss += step_result.G_l1_loss.item()
-            dssim += step_result.dssim
-
-        G_val_losses.append(val_G_loss / n_val_batches)
-        D_val_losses.append(val_D_loss / n_val_batches)
-        L1_val_losses.append(val_L1_loss / n_val_batches)
+            pass
 
         torch.cuda.synchronize()
         epoch_end_time = time.time()
 
-        mlflow.log_metric("train_G_loss", train_G_loss, step=epoch)
-        mlflow.log_metric("train_D_loss", train_D_loss, step=epoch)
-        mlflow.log_metric("train_L1_loss", train_L1_loss, step=epoch)
-        mlflow.log_metric("val_G_loss", val_G_loss, step=epoch)
-        mlflow.log_metric("val_D_loss", val_D_loss, step=epoch)
-        mlflow.log_metric("val_L1_loss", val_L1_loss, step=epoch)
-        mlflow.log_metric(
-            "epoch_duration", epoch_end_time - epoch_start_time, step=epoch
+        trainResults.finish_train_epoch(
+            epoch, n_batches, epoch_end_time, epoch_start_time
         )
-        print(
-            f"Epoch: {epoch}, time_elapsed: {epoch_end_time - epoch_start_time:.2f} seconds | ",
-            f"train_G_loss: {train_G_loss:.3f} | train_L1_loss: {train_L1_loss:.3f} | train_D_loss: {train_D_loss:.3f} | ",
-            f"val_G_loss: {val_G_loss:.3f} | val_L1_loss: {val_L1_loss:.3f} | val_D_loss: {val_D_loss:.3f}",
-            sep="\n",
-        )
-        if epoch % 20 == 0:
-            avg_dssim = dssim / n_val_batches
-            print(f"average dssim score : {avg_dssim}")
-            mlflow.log_metric("val_dssim", avg_dssim, step=epoch)
         visualize_batch(G, inputs, targets, epoch)
         generate_image(G, inputs[0], targets[0], epoch, f"epoch: {epoch}")
+
+        # if epoch % 20 == 0:
+        #     avg_dssim = dssim / n_val_batches
+        #     print(f"average dssim score : {avg_dssim}")
+        #     mlflow.log_metric("val_dssim", avg_dssim, step=epoch)
+
     print("Training finished!")
-    return G_train_losses, D_train_losses
+    return trainResults
 
 
 # declaration for this function should not be changed
@@ -410,7 +472,7 @@ def training(dataset_path: Path) -> None:
     print("Starting mlflow")
     # Create a new MLflow Experiment
 
-    run_name = "condGAN_13_300_epoch"
+    run_name = "condGAN_17_600_epoch"
     mlflow.set_experiment("Colorization_01")
 
     try:
@@ -419,7 +481,8 @@ def training(dataset_path: Path) -> None:
         mlflow.end_run()
         mlflow.start_run()
 
-    img_paths_df = get_image_paths_df(dataset_path)
+    img_paths_df = get_train_image_paths_df(dataset_path)
+    # img_paths_df = get_image_paths_df(dataset_path, n=5000)
 
     train_dataset, val_dataset, _ = split_dataset(img_paths_df, 0.10, 0.1)
 
@@ -441,13 +504,8 @@ def training(dataset_path: Path) -> None:
     D = Discriminator(3).to(device)
     G = Generator().to(device)
 
-    # D, G = (
-    #     torch.compile(D, mode="reduce-overhead"),
-    #     torch.compile(G, mode="reduce-overhead"),
-    # )
-
     optimizer_G = Adam(G.parameters(), lr=config.G_lr, betas=config.momentum_betas)
-    optimizer_D = Adam(D.parameters(), lr=config.D_lr, betas=config.momentum_betas)
+    optimizer_D = RMSprop(D.parameters(), lr=config.D_lr)
 
     # train the network
     train_losses, val_losses = fit(
