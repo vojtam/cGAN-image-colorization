@@ -22,7 +22,6 @@ from tqdm import tqdm
 
 from dataset import (
     WrappedDataLoader,
-    get_image_paths_df,
     split_dataset,
 )
 from evaluation import dssim
@@ -38,45 +37,46 @@ def set_global_random_seed(seed):
     torch.backends.cudnn.benchmark = True
 
 
-set_global_random_seed(42)
-
-
 BCELogitsLoss = nn.BCEWithLogitsLoss()
 L1Loss = torch.nn.L1Loss()
 
 
 @dataclass
 class config:
-    G_lr: float = 0.0005
-    D_lr: float = 0.000001
+    G_lr: float = 0.0002
+    D_lr: float = 0.00001
     batch_size: int = 64
-    LAMBDA: int = 80
+    LAMBDA: int = 65
     momentum_betas: tuple[float, float] = (0.5, 0.999)
-    epoch_num: int = 300
+    epoch_num: int = 800
+    random_seed: int = 42
+
+
+set_global_random_seed(config.random_seed)
 
 
 # sample function for model architecture visualization
 # draw_graph function saves an additional file: Graphviz DOT graph file, it's not necessary to delete it
-def draw_network_architecture(net: nn.Module, input_sample: Tensor) -> None:
+def draw_network_architecture(
+    net: nn.Module, input_sample: Tensor, filename: str = "model_architecture"
+) -> None:
     # saves visualization of model architecture to the model_architecture.png
     draw_graph(
         net,
         input_sample,
         graph_dir="TB",
         save_graph=True,
-        filename="model_architecture",
+        filename=filename,
         expand_nested=True,
     )
 
 
 # sample function for losses visualization
-def plot_learning_curves(
-    train_losses: list[float], validation_losses: list[float]
-) -> None:
+def plot_learning_curves(losses_dict: dict[list[float]]) -> None:
     plt.figure(figsize=(10, 5))
     plt.title("Train and Evaluation Losses During Training")
-    plt.plot(train_losses, label="train_loss")
-    plt.plot(validation_losses, label="validation_loss")
+    for label, loss in losses_dict.items():
+        plt.plot(loss, label=label)
     plt.xlabel("iterations")
     plt.ylabel("Loss")
     plt.legend()
@@ -215,30 +215,30 @@ def train_step(
     targets: Tensor,
     device: torch.device,
 ):
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        generator_output = G(inputs)  #
+    optimizer_D.zero_grad()
+    optimizer_G.zero_grad()
 
-        generated = torch.concat(
-            (inputs, generator_output.detach()), dim=1
-        )  # Note to self: need to use detach here to keep the computational graphs separate -> otherwise backprop would break
-        real = torch.concat((inputs, targets), dim=1)
-        discriminator_generated_output = D(generated)
-        discriminator_real_output = D(real)
+    generator_output = G(inputs)  #
+    generated = torch.concat(
+        (inputs, generator_output.detach()), dim=1
+    )  # Note to self: need to use detach here to keep the computational graphs separate -> otherwise backprop would break
+    real = torch.concat((inputs, targets), dim=1)
+    discriminator_generated_output = D(generated)
+    discriminator_real_output = D(real)
 
     D_loss = discriminator_loss(
         discriminator_generated_output, discriminator_real_output, smoothing_factor=0.9
     )
-    optimizer_D.zero_grad()
-    if random.random() > 0.7:
-        D_loss.backward()
-        optimizer_D.step()
+    D_loss.backward()
+    optimizer_D.step()
 
     G_fake = torch.concat((inputs, generator_output), dim=1)
     D_fake_output = D(G_fake)
-    G_loss, G_L1_loss = generator_loss(D_fake_output, generator_output, targets)
+    G_loss, G_L1_loss = generator_loss(
+        D_fake_output, generator_output, targets, LAMBDA=config.LAMBDA
+    )
     G_total_loss = G_loss + G_L1_loss
 
-    optimizer_G.zero_grad()
     G_total_loss.backward()
     optimizer_G.step()
 
@@ -254,26 +254,25 @@ def valid_step(
     device: torch.device,
     epoch: int,
 ):
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        generator_output = G(inputs)
+    generator_output = G(inputs)
 
-        generated = torch.cat((inputs, generator_output), dim=1)
-        real = torch.cat((inputs, targets), dim=1)
-        discriminator_generated_output = D(generated)
-        discriminator_real_output = D(real)
+    generated = torch.cat((inputs, generator_output), dim=1)
+    real = torch.cat((inputs, targets), dim=1)
+    discriminator_generated_output = D(generated)
+    discriminator_real_output = D(real)
 
-        D_loss = discriminator_loss(
-            discriminator_generated_output, discriminator_real_output
-        )
+    D_loss = discriminator_loss(
+        discriminator_generated_output, discriminator_real_output
+    )
 
-        G_loss, G_L1_loss = generator_loss(
-            discriminator_generated_output,
-            generator_output,
-            targets,
-            LAMBDA=config.LAMBDA,
-        )
+    G_loss, G_L1_loss = generator_loss(
+        discriminator_generated_output,
+        generator_output,
+        targets,
+        LAMBDA=config.LAMBDA,
+    )
 
-        G_total_loss = G_loss + G_L1_loss
+    G_total_loss = G_loss + G_L1_loss
 
     if epoch % 20 == 0:
         pred_RGB = (
@@ -392,10 +391,21 @@ def fit(
             avg_dssim = dssim / n_batches
             print(f"average dssim score : {avg_dssim}")
             mlflow.log_metric("val_dssim", avg_dssim, step=epoch)
+        if epoch > 0 and epoch % 50 == 0:
+            print("Saving model checkpoints")
+            torch.save(G.state_dict(), Path(f"models/data_col_public/G_{epoch}.pt"))
+            torch.save(D.state_dict(), Path(f"models/data_col_public/D_{epoch}.pt"))
         visualize_batch(G, inputs, targets, epoch)
         generate_image(G, inputs[0], targets[0], epoch, f"epoch: {epoch}")
     print("Training finished!")
-    return G_train_losses, D_train_losses
+    return {
+        "G_train_losses": G_train_losses,
+        "D_train_losses": D_train_losses,
+        "G_val_losses": G_val_losses,
+        "D_val_losses": D_val_losses,
+        "L1_train_losses": L1_train_losses,
+        "L1_val_losses": L1_val_losses,
+    }
 
 
 # declaration for this function should not be changed
@@ -414,12 +424,12 @@ def training(dataset_path: Path) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Computing with {}!".format(device))
     # Set our tracking server uri for logging
-    # RUN mlflow server --host 127.0.0.1 --port 5051
-    mlflow.set_tracking_uri(uri="http://127.0.0.1:5051")
+    # RUN mlflow server --host 127.0.0.1 --port 5053
+    mlflow.set_tracking_uri(uri="http://127.0.0.1:5053")
     print("Starting mlflow")
     # Create a new MLflow Experiment
 
-    run_name = "condGAN_20_RGB_300_epoch"
+    run_name = "condGAN_23_RGB_800_epoch"
     mlflow.set_experiment("Colorization_01")
 
     try:
@@ -428,9 +438,15 @@ def training(dataset_path: Path) -> None:
         mlflow.end_run()
         mlflow.start_run()
 
-    img_paths_df = get_image_paths_df(dataset_path, 600)
+    from dataset import get_image_paths_df
 
-    train_dataset, val_dataset, _ = split_dataset(img_paths_df, 0.10, 0.1)
+    img_paths_df = get_image_paths_df(dataset_path)
+    # COCO
+    # from dataset import get_paths_df
+
+    # img_paths_df = get_paths_df(dataset_path, n=8000)
+
+    train_dataset, val_dataset, _ = split_dataset(img_paths_df, 0.10, 0.10)
 
     train_dataloader = WrappedDataLoader(
         DataLoader(
@@ -454,7 +470,7 @@ def training(dataset_path: Path) -> None:
     optimizer_D = Adam(D.parameters(), lr=config.D_lr, betas=config.momentum_betas)
 
     # train the network
-    train_losses, val_losses = fit(
+    losses_dict = fit(
         G,
         D,
         train_dataloader,
@@ -462,6 +478,19 @@ def training(dataset_path: Path) -> None:
         optimizer_G,
         optimizer_D,
         device,
+    )
+
+    import pickle
+
+    with open("training_losses_dict.pkl", "wb") as file:
+        pickle.dump(losses_dict, file)
+
+    plot_learning_curves(losses_dict)
+    draw_network_architecture(
+        G, torch.rand((1, 3, 512, 384)).to(device), "G_model_architecture"
+    )
+    draw_network_architecture(
+        D, torch.rand((1, 6, 512, 384)).to(device), "D_model_architecture"
     )
 
     torch.save(G.state_dict(), Path(f"models/G_{run_name}.pt"))
