@@ -13,7 +13,6 @@ from PIL import Image
 from torchvision.transforms.functional import pil_to_tensor
 from tqdm import tqdm
 
-from dataset import lab_to_rgb_np, rgb_to_lab
 from network import Generator
 
 
@@ -46,21 +45,16 @@ def inference(dataset_path: Path, model_path: Path) -> None:
     model.eval()
 
     img_paths = get_image_paths(dataset_path)
-    print(img_paths)
 
     for input_img_path in tqdm(img_paths):
         input_img = pil_to_tensor(Image.open(input_img_path)) / 255
 
-        print(input_img.shape)
         if input_img.shape[0] == 1:
             input_img = input_img.repeat(3, 1, 1)
-        L_input, ab_input = rgb_to_lab(input_img)
 
-        print(L_input.shape)
-        print(ab_input.shape)
-        ab_generated = model(L_input.unsqueeze(0).to(device))[0]
-        print(ab_generated.shape)
-        generated_image = lab_to_rgb_np(L_input, ab_generated.detach().cpu())
+        generated_image = (
+            model(input_img.unsqueeze(0).to(device))[0].permute((1, 2, 0)).cpu().numpy()
+        )
         generated_image = (generated_image * 255).astype(np.uint8)
 
         dir_path = Path("output_predictions")
