@@ -6,16 +6,15 @@
 from pathlib import Path
 
 import albumentations as A
-import numpy as np
-import torch
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from polars import DataFrame
-from skimage.color import lab2rgb, rgb2lab
 from sklearn.model_selection import train_test_split
-from torch import Tensor, from_numpy
+from torch import Tensor
 from torch.utils.data import Dataset
 from torchvision.transforms import ToTensor
+
+from training import config
 
 
 class ImageDataset(Dataset[Tensor]):
@@ -35,6 +34,7 @@ class ImageDataset(Dataset[Tensor]):
         img_rgb = ToTensor()(img_rgb)
         img_gray = Image.open(img_gray_path).convert("RGB")
         img_gray = ToTensor()(img_gray)
+        # img_gray = rgb_to_grayscale(img_rgb, num_output_channels=3)
 
         if self.transform is not None:
             img_gray = img_gray.permute(1, 2, 0).numpy()
@@ -66,16 +66,11 @@ def get_train_transforms():
             A.Resize(600, 420),
             A.RandomCrop(512, 384),  # 4x3
             A.HorizontalFlip(p=0.5),
-            # A.Rotate(limit=30.0, p=0.5),
-            A.ColorJitter(p=0.2),
-            A.Normalize(
-                mean=[0.5, 0.5, 0.5],
-                std=[0.5, 0.5, 0.5],
-                max_pixel_value=255.0,
-            ),
             ToTensorV2(),
         ],
         additional_targets={"rgb_image": "image"},
+        strict=True,
+        seed=config.random_seed,
     )
     return train_transform
 
@@ -84,13 +79,11 @@ def get_val_transforms():
     return A.Compose(
         [
             A.Resize(512, 384),
-            A.Normalize(
-                mean=[0.5, 0.5, 0.5],
-                std=[0.5, 0.5, 0.5],
-                max_pixel_value=255.0,
-            ),
             A.ToTensorV2(),
-        ]
+        ],
+        additional_targets={"rgb_image": "image"},
+        strict=True,
+        seed=config.random_seed,
     )
 
 
@@ -101,8 +94,8 @@ def split_dataset(
     train_df, valid_df = train_test_split(train_df, test_size=val_size)
 
     train_dataset = ImageDataset(train_df, get_train_transforms())
-    val_dataset = ImageDataset(valid_df)
-    test_dataset = ImageDataset(test_df)
+    val_dataset = ImageDataset(valid_df, get_val_transforms())
+    test_dataset = ImageDataset(test_df, get_val_transforms())
 
     return (train_dataset, val_dataset, test_dataset)
 
@@ -132,47 +125,58 @@ def get_image_paths_df(dataset_path: Path, n: int | None = None) -> list[str]:
     return DataFrame({"img_gray_path": img_gray_paths, "img_rgb_path": img_rgb_paths})
 
 
-def rgb_to_lab(img_rgb: Tensor):
-    img_lab = rgb2lab(img_rgb.permute(1, 2, 0).numpy()).astype("float32")
-    img_lab = from_numpy(img_lab).permute(2, 0, 1)
-    L = img_lab[[0], ...] / 50.0 - 1.0  # Between -1 and 1
-    ab = img_lab[[1, 2], ...] / 110.0  # Between -1 and 1
-    return L, ab
+def get_paths_df(dataset_path: Path, extension=".jpg", n: int | None = None):
+    if n is not None:
+        return DataFrame(
+            {"img_rgb_path": list(dataset_path.rglob(f"*{extension}"))[:n]}
+        )
+    return DataFrame({"img_rgb_path": list(dataset_path.rglob(f"*{extension}"))})
 
 
-def lab_to_rgb_np(L: Tensor, ab: Tensor) -> np.array:
-    L = (
-        L + 1
-    ) * 50.0  # reverse the transformation to range -1 and 1 done in dataset __getitem__
-    ab = ab * 110.0
-    lab = torch.cat((L, ab), dim=0).permute(1, 2, 0).cpu().detach().numpy()
-    rgb_np = lab2rgb(lab)
-    return rgb_np
+# I experimented with converting the images to LAB colorspace but the results did not look better so I switched back for simplicity
+# keeping this here for now in case I may need it
+
+# def rgb_to_lab(img_rgb: Tensor):
+#     img_lab = rgb2lab(img_rgb.permute(1, 2, 0).numpy()).astype("float32")
+#     img_lab = from_numpy(img_lab).permute(2, 0, 1)
+#     L = img_lab[[0], ...] / 50.0 - 1.0  # Between -1 and 1
+#     ab = img_lab[[1, 2], ...] / 110.0  # Between -1 and 1
+#     return L, ab
 
 
-def lab_to_rgb_torch(L: Tensor, ab: Tensor) -> Tensor:
-    rgb_torch = torch.from_numpy(lab_to_rgb_batch_np(L, ab)).permute(2, 0, 1)
-    return rgb_torch
+# def lab_to_rgb_np(L: Tensor, ab: Tensor) -> np.array:
+#     L = (
+#         L + 1
+#     ) * 50.0  # reverse the transformation to range -1 and 1 done in dataset __getitem__
+#     ab = ab * 110.0
+#     lab = torch.cat((L, ab), dim=0).permute(1, 2, 0).cpu().detach().numpy()
+#     rgb_np = lab2rgb(lab)
+#     return rgb_np
 
 
-def lab_to_rgb_batch_np(batch_L: Tensor, batch_ab: Tensor) -> np.array:
-    batch_L = (
-        batch_L + 1.0
-    ) * 50.0  # reverse the transformation to range -1 and 1 done in dataset __getitem__
-    batch_ab = batch_ab * 110.0
-    batch_Lab = (
-        torch.cat((batch_L, batch_ab), dim=1).permute(0, 2, 3, 1).cpu().detach().numpy()
-    )
-    rgb_imgs = np.stack(
-        [lab2rgb(lab_img) for lab_img in batch_Lab], axis=0
-    )  # convert and stack them on top of each other
-
-    return rgb_imgs
+# def lab_to_rgb_torch(L: Tensor, ab: Tensor) -> Tensor:
+#     rgb_torch = torch.from_numpy(lab_to_rgb_batch_np(L, ab)).permute(2, 0, 1)
+#     return rgb_torch
 
 
-def lab_to_rgb_batch_torch(batch_L: Tensor, batch_ab: Tensor) -> Tensor:
-    rgb_imgs = torch.from_numpy(lab_to_rgb_batch_np(batch_L, batch_ab)).permute(
-        0, 3, 1, 2
-    )  # convert
+# def lab_to_rgb_batch_np(batch_L: Tensor, batch_ab: Tensor) -> np.array:
+#     batch_L = (
+#         batch_L + 1.0
+#     ) * 50.0  # reverse the transformation to range -1 and 1 done in dataset __getitem__
+#     batch_ab = batch_ab * 110.0
+#     batch_Lab = (
+#         torch.cat((batch_L, batch_ab), dim=1).permute(0, 2, 3, 1).cpu().detach().numpy()
+#     )
+#     rgb_imgs = np.stack(
+#         [lab2rgb(lab_img) for lab_img in batch_Lab], axis=0
+#     )  # convert and stack them on top of each other
 
-    return rgb_imgs
+#     return rgb_imgs
+
+
+# def lab_to_rgb_batch_torch(batch_L: Tensor, batch_ab: Tensor) -> Tensor:
+#     rgb_imgs = torch.from_numpy(lab_to_rgb_batch_np(batch_L, batch_ab)).permute(
+#         0, 3, 1, 2
+#     )  # convert
+
+#     return rgb_imgs
