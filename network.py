@@ -37,7 +37,9 @@ def discriminator_loss(
     D_fake_loss = BCELogitsLoss(discriminator_generated_output, fake_labels)
     D_real_loss = BCELogitsLoss(discriminator_real_output, real_labels)
 
-    D_loss = (D_fake_loss + D_real_loss) / 2
+    D_loss = (
+        D_fake_loss + D_real_loss
+    ) / 2  # divide by 2 per paper to slow down discriminator learning
     return D_loss
 
 
@@ -47,7 +49,15 @@ class Generator(nn.Module):
 
         # Each block in the encoder is: Convolution -> Batch normalization -> Leaky ReLU
 
-        down_filters = [3, 64, 64, 128, 256, 256, 512]
+        down_filters = [
+            3,
+            64,
+            64,
+            128,
+            256,
+            256,
+            512,
+        ]
         use_batch_norm = [False, False, True, True, True, True, False]
 
         self.down_layers = nn.ModuleList(
@@ -80,7 +90,9 @@ class Generator(nn.Module):
                 padding=1,
                 bias=False,
             ),
-            nn.Tanh(),
+            # nn.Tanh(), # I don't really know why but replacing the tanh with sigmoid and not normalizing to [-1, 1] made the resulting images look better
+            # probably bug in my code
+            nn.Sigmoid(),
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -107,10 +119,10 @@ class Discriminator(nn.Module):
         layers = nn.ModuleList(
             [
                 DownBlock(input_channels, 64, False),
-                DownBlock(64, 128),
-                DownBlock(128, 256),
+                DownBlock(64, 128, stride=1),
+                # DownBlock(128, 256), # trying to removing some blocks to make discriminator a bit weaker = it used to go quickly to 0
                 # DownBlock(256, 512, stride=1),
-                nn.Conv2d(256, 1, kernel_size=(4, 4), stride=1, padding=1),
+                nn.Conv2d(128, 1, kernel_size=(4, 4), stride=1, padding=1),
             ]
         )
 
@@ -177,13 +189,4 @@ class UpBlock(nn.Module):
 
     def forward(self, x: Tensor, residual_x: Tensor) -> Tensor:
         x = self.upsample(x)
-        # Note to self:
-        # in case the input image had odd resolution in any dimensions,
-        # due to using mostly stride 2, the image resolution might have gotten rounded at some point
-        # and the dimensions of the skip with the x might not be compatible =>
-        # => interpolating the single value should solve it
-        # if the shapes match, the tensor will be as it was
-        residual_x = torch.nn.functional.interpolate(
-            residual_x, size=x.shape[2:], mode="nearest"
-        )
         return torch.cat([x, residual_x], dim=1)
