@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import mlflow
+#import mlflow
 import numpy as np
 import torch
 from torch import Tensor, nn
@@ -25,7 +25,7 @@ from dataset import (
     split_dataset,
 )
 from evaluation import dssim
-from network import Discriminator, Generator, discriminator_loss, generator_loss
+from network import Discriminator, Generator, discriminator_loss, generator_loss, GAN
 
 
 def set_global_random_seed(seed):
@@ -45,10 +45,10 @@ L1Loss = torch.nn.L1Loss()
 class config:
     G_lr: float = 0.0002
     D_lr: float = 0.00001
-    batch_size: int = 64
+    batch_size: int = 16
     LAMBDA: int = 65
     momentum_betas: tuple[float, float] = (0.5, 0.999)
-    epoch_num: int = 800
+    epoch_num: int = 1
     random_seed: int = 42
 
 
@@ -109,7 +109,7 @@ def generate_image(
     # input has a shape C x H x W
     # target has a shape C x H x W
     model.eval()
-    predicted = model(input.unsqueeze(0))  # add a batch dimension
+    predicted = model(input.unsqueeze(0))  # add a batch dimension so that I can feed it to the Generator
     model.train()
     target_np = target.permute(1, 2, 0).cpu().detach().numpy()
     predicted_np = predicted.squeeze().permute(1, 2, 0).cpu().detach().numpy()
@@ -372,15 +372,15 @@ def fit(
         torch.cuda.synchronize()
         epoch_end_time = time.time()
 
-        mlflow.log_metric("train_G_loss", train_G_loss, step=epoch)
-        mlflow.log_metric("train_D_loss", train_D_loss, step=epoch)
-        mlflow.log_metric("train_L1_loss", train_L1_loss, step=epoch)
-        mlflow.log_metric("val_G_loss", val_G_loss, step=epoch)
-        mlflow.log_metric("val_D_loss", val_D_loss, step=epoch)
-        mlflow.log_metric("val_L1_loss", val_L1_loss, step=epoch)
-        mlflow.log_metric(
-            "epoch_duration", epoch_end_time - epoch_start_time, step=epoch
-        )
+        # mlflow.log_metric("train_G_loss", train_G_loss, step=epoch)
+        # mlflow.log_metric("train_D_loss", train_D_loss, step=epoch)
+        # mlflow.log_metric("train_L1_loss", train_L1_loss, step=epoch)
+        # mlflow.log_metric("val_G_loss", val_G_loss, step=epoch)
+        # mlflow.log_metric("val_D_loss", val_D_loss, step=epoch)
+        # mlflow.log_metric("val_L1_loss", val_L1_loss, step=epoch)
+        # mlflow.log_metric(
+        #     "epoch_duration", epoch_end_time - epoch_start_time, step=epoch
+        # )
         print(
             f"Epoch: {epoch}, time_elapsed: {epoch_end_time - epoch_start_time:.2f} seconds | ",
             f"train_G_loss: {train_G_loss:.3f} | train_L1_loss: {train_L1_loss:.3f} | train_D_loss: {train_D_loss:.3f} | ",
@@ -390,13 +390,13 @@ def fit(
         if epoch % 20 == 0:
             avg_dssim = dssim / n_batches
             print(f"average dssim score : {avg_dssim}")
-            mlflow.log_metric("val_dssim", avg_dssim, step=epoch)
-        if epoch > 0 and epoch % 50 == 0:
-            print("Saving model checkpoints")
-            torch.save(G.state_dict(), Path(f"models/data_col_public/G_{epoch}.pt"))
-            torch.save(D.state_dict(), Path(f"models/data_col_public/D_{epoch}.pt"))
-        visualize_batch(G, inputs, targets, epoch)
-        generate_image(G, inputs[0], targets[0], epoch, f"epoch: {epoch}")
+            #mlflow.log_metric("val_dssim", avg_dssim, step=epoch)
+       # if epoch > 0 and epoch % 50 == 0:
+       #     print("Saving model checkpoints")
+       #     torch.save(G.state_dict(), Path(f"models/data_col_public/G_{epoch}.pt"))
+       #     torch.save(D.state_dict(), Path(f"models/data_col_public/D_{epoch}.pt"))
+        # visualize_batch(G, inputs, targets, epoch)
+        # generate_image(G, inputs[0], targets[0], epoch, f"epoch: {epoch}")
     print("Training finished!")
     return {
         "G_train_losses": G_train_losses,
@@ -425,38 +425,34 @@ def training(dataset_path: Path) -> None:
     print("Computing with {}!".format(device))
     # Set our tracking server uri for logging
     # RUN mlflow server --host 127.0.0.1 --port 5053
-    mlflow.set_tracking_uri(uri="http://127.0.0.1:5053")
-    print("Starting mlflow")
+    # mlflow.set_tracking_uri(uri="http://127.0.0.1:5053")
+    # print("Starting mlflow")
     # Create a new MLflow Experiment
 
-    run_name = "condGAN_23_RGB_800_epoch"
-    mlflow.set_experiment("Colorization_01")
+    run_name = "condGAN_RGB_300_epoch"
+    # mlflow.set_experiment("Colorization_01")
 
-    try:
-        mlflow.start_run(run_name=run_name)
-    except:
-        mlflow.end_run()
-        mlflow.start_run()
-
+    # try:
+    #     mlflow.start_run(run_name=run_name)
+    # except:
+    #     mlflow.end_run()
+    #     mlflow.start_run()
+    #
     from dataset import get_image_paths_df
 
     img_paths_df = get_image_paths_df(dataset_path)
-    # COCO
-    # from dataset import get_paths_df
 
-    # img_paths_df = get_paths_df(dataset_path, n=8000)
-
-    train_dataset, val_dataset, _ = split_dataset(img_paths_df, 0.10, 0.10)
+    train_dataset, val_dataset, test_dataset = split_dataset(img_paths_df, 0.10, 0.10)
 
     train_dataloader = WrappedDataLoader(
         DataLoader(
-            train_dataset, shuffle=True, batch_size=config.batch_size, num_workers=10
+            train_dataset, shuffle=True, batch_size=config.batch_size, num_workers=4
         ),
         device,
     )
     val_dataloader = WrappedDataLoader(
         DataLoader(
-            val_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4
+            val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=2
         ),
         device,
     )
@@ -480,22 +476,13 @@ def training(dataset_path: Path) -> None:
         device,
     )
 
-    import pickle
-
-    with open("training_losses_dict.pkl", "wb") as file:
-        pickle.dump(losses_dict, file)
 
     plot_learning_curves(losses_dict)
-    draw_network_architecture(
-        G, torch.rand((1, 3, 512, 384)).to(device), "G_model_architecture"
-    )
-    draw_network_architecture(
-        D, torch.rand((1, 6, 512, 384)).to(device), "D_model_architecture"
-    )
-
-    torch.save(G.state_dict(), Path(f"models/G_{run_name}.pt"))
-    torch.save(D.state_dict(), Path(f"models/D_{run_name}.pt"))
-    mlflow.end_run()
+    draw_network_architecture(GAN(G, D), torch.rand((1, 3, 512, 384)).to(device))
+    # torch.save(G.state_dict(), Path(f"models/G_{run_name}.pt"))
+    torch.save(G.state_dict(), Path(f"model.pt"))
+    # torch.save(D.state_dict(), Path(f"models/D_{run_name}.pt"))
+    # mlflow.end_run()
 
 
 # #### code below should not be changed ############################################################################

@@ -135,6 +135,19 @@ class Discriminator(nn.Module):
         x = self.discriminator_layers(x)
         return x
 
+# This torch module class is only for the final architecture visualization
+# so that I can visualize both the Generator and Discriminator in the same image
+class GAN(nn.Module):
+    def __init__(self, G: Generator, D: Discriminator):
+        super().__init__()
+        self.G = G
+        self.D = D
+
+    def forward(self, x: Tensor):
+        xg_out = self.G(x)
+        xd_out = self.D(x.repeat([1, 2, 1, 1]))
+        return xg_out, xd_out
+
 
 class DownBlock(nn.Module):
     def __init__(
@@ -163,6 +176,8 @@ class DownBlock(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.downsample(x)
+
+
 
 
 class UpBlock(nn.Module):

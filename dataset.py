@@ -12,14 +12,15 @@ from polars import DataFrame
 from sklearn.model_selection import train_test_split
 from torch import Tensor
 from torch.utils.data import Dataset
-from torchvision.transforms import ToTensor
+from torchvision.transforms import ToTensor, ColorJitter
 
 
 class ImageDataset(Dataset[Tensor]):
-    def __init__(self, image_paths_df: DataFrame, transform=None, n: int | None = None):
-        self.n = n
+    def __init__(self, image_paths_df: DataFrame, transform=None, apply_color_jitter: bool = False):
         self.img_paths_df = image_paths_df
         self.transform = transform
+        self.color_jitter = ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2) if apply_color_jitter else None
+        
 
     def __len__(self) -> int:
         return len(self.img_paths_df)
@@ -41,6 +42,9 @@ class ImageDataset(Dataset[Tensor]):
             transformed = self.transform(image=img_gray, rgb_image=img_rgb)
             img_gray = transformed["image"]
             img_rgb = transformed["rgb_image"]
+
+        if self.color_jitter is not None:
+            img_rgb = self.color_jitter(img_rgb)
         return img_gray, img_rgb
 
 
@@ -86,12 +90,12 @@ def get_val_transforms():
 
 
 def split_dataset(
-    img_path_df: Dataset, test_size: float = 0.15, val_size: float = 0.10
+    img_path_df: DataFrame, test_size: float = 0.15, val_size: float = 0.10
 ) -> tuple[Dataset, Dataset, Dataset]:
     train_df, test_df = train_test_split(img_path_df, test_size=test_size)
     train_df, valid_df = train_test_split(train_df, test_size=val_size)
 
-    train_dataset = ImageDataset(train_df, get_train_transforms())
+    train_dataset = ImageDataset(train_df, get_train_transforms(), True)
     val_dataset = ImageDataset(valid_df, get_val_transforms())
     test_dataset = ImageDataset(test_df, get_val_transforms())
 
