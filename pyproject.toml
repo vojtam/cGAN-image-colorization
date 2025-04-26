@@ -1,5 +1,5 @@
 [project]
-name = "projcode-uco"
+name = "COL-505941"
 version = "0.1.0"
 description = ""
 readme = "README.md"
@@ -21,4 +21,5 @@ dependencies = [
     "torchvision>=0.21.0",
     "tqdm>=4.67.1",
     "triton>=3.2.0",
+    "pandas",
 ]

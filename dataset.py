@@ -14,8 +14,6 @@ from torch import Tensor
 from torch.utils.data import Dataset
 from torchvision.transforms import ToTensor
 
-from training import config
-
 
 class ImageDataset(Dataset[Tensor]):
     def __init__(self, image_paths_df: DataFrame, transform=None, n: int | None = None):
@@ -70,7 +68,7 @@ def get_train_transforms():
         ],
         additional_targets={"rgb_image": "image"},
         strict=True,
-        seed=config.random_seed,
+        seed=42,
     )
     return train_transform
 
@@ -83,7 +81,7 @@ def get_val_transforms():
         ],
         additional_targets={"rgb_image": "image"},
         strict=True,
-        seed=config.random_seed,
+        seed=42,
     )
 
 
@@ -114,6 +112,7 @@ def get_image_paths_df(dataset_path: Path, n: int | None = None) -> list[str]:
             for image in dir.iterdir():
                 if image.suffix in [".png", ".jpg"]:
                     img_rgb_paths.append(image.as_posix())
+    img_gray_paths, img_rgb_paths = sorted(img_gray_paths), sorted(img_rgb_paths)
     if n is not None:
         assert n < len(img_gray_paths), (
             "n must be <= the number of examples in the dataset"
