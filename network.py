@@ -1,9 +1,3 @@
-# STUDENT's UCO: 505941
-
-# Description:
-# This file should contain network class. The class should subclass the torch.nn.Module class.
-
-
 import torch
 from torch import Tensor, nn
 
@@ -120,12 +114,13 @@ class Discriminator(nn.Module):
             [
                 DownBlock(input_channels, 64, False),
                 DownBlock(64, 128, stride=1),
-                # DownBlock(128, 256), # trying to removing some blocks to make discriminator a bit weaker = it used to go quickly to 0
-                # DownBlock(256, 512, stride=1),
-                nn.Conv2d(128, 1, kernel_size=(4, 4), stride=1, padding=1),
+                DownBlock(128, 256),
+                DownBlock(256, 512, stride=1),
+                nn.Conv2d(512, 1, kernel_size=(4, 4), stride=1, padding=1),
             ]
         )
-
+        # attribution: I read at multiple places that this should help stabilize the GAN's training
+        # I'm not really knowledgable in whether it really works or if I'm even using it correctly
         for layer in layers[:-1]:
             nn.utils.parametrizations.spectral_norm(layer.downsample[0])
         nn.utils.parametrizations.spectral_norm(layers[-1])
@@ -134,6 +129,7 @@ class Discriminator(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = self.discriminator_layers(x)
         return x
+
 
 # This torch module class is only for the final architecture visualization
 # so that I can visualize both the Generator and Discriminator in the same image
@@ -176,8 +172,6 @@ class DownBlock(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.downsample(x)
-
-
 
 
 class UpBlock(nn.Module):

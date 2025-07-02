@@ -1,5 +1,3 @@
-# STUDENT's UCO: 505941
-
 # Description:
 # This file should be used for performing training of a network
 # Usage: python training.py <dataset_path>
@@ -11,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-#import mlflow
+import mlflow
 import numpy as np
 import torch
 from torch import Tensor, nn
@@ -20,12 +18,9 @@ from torch.utils.data import DataLoader
 from torchview import draw_graph
 from tqdm import tqdm
 
-from dataset import (
-    WrappedDataLoader,
-    split_dataset,
-)
+from dataset import WrappedDataLoader, get_paths_df, split_dataset
 from evaluation import dssim
-from network import Discriminator, Generator, discriminator_loss, generator_loss, GAN
+from network import GAN, Discriminator, Generator, discriminator_loss, generator_loss
 
 
 def set_global_random_seed(seed):
@@ -33,8 +28,6 @@ def set_global_random_seed(seed):
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
 
 
 BCELogitsLoss = nn.BCEWithLogitsLoss()
@@ -48,15 +41,15 @@ class config:
     batch_size: int = 16
     LAMBDA: int = 65
     momentum_betas: tuple[float, float] = (0.5, 0.999)
-    epoch_num: int = 1
+    epoch_num: int = 600
     random_seed: int = 42
 
 
 set_global_random_seed(config.random_seed)
 
 
-# sample function for model architecture visualization
-# draw_graph function saves an additional file: Graphviz DOT graph file, it's not necessary to delete it
+#  function for model architecture visualization
+# draw_graph function saves an additional file: Graphviz DOT graph file
 def draw_network_architecture(
     net: nn.Module, input_sample: Tensor, filename: str = "model_architecture"
 ) -> None:
@@ -71,7 +64,6 @@ def draw_network_architecture(
     )
 
 
-# sample function for losses visualization
 def plot_learning_curves(losses_dict: dict[list[float]]) -> None:
     plt.figure(figsize=(10, 5))
     plt.title("Train and Evaluation Losses During Training")
@@ -109,7 +101,9 @@ def generate_image(
     # input has a shape C x H x W
     # target has a shape C x H x W
     model.eval()
-    predicted = model(input.unsqueeze(0))  # add a batch dimension so that I can feed it to the Generator
+    predicted = model(
+        input.unsqueeze(0)
+    )  # add a batch dimension so that I can feed it to the Generator
     model.train()
     target_np = target.permute(1, 2, 0).cpu().detach().numpy()
     predicted_np = predicted.squeeze().permute(1, 2, 0).cpu().detach().numpy()
@@ -156,6 +150,7 @@ def visualize_batch(
     inputs: Tensor,
     targets: Tensor,
     epoch: int,
+    num_images: int = 4,
     save=True,
     save_path=Path("gen_images/batch"),
 ):
@@ -174,28 +169,24 @@ def visualize_batch(
     if generated_imgs.min() < 0 or generated_imgs.max() > 1:
         generated_imgs = scale_to_zero_one(generated_imgs)
 
-    plt.figure(figsize=(10, 5))
-    for i in range(5):
-        ax = plt.subplot(3, 5, i + 1)
-        ax.imshow(grayscale[i], cmap="gray")
-        ax.axis("off")
-        if i == 2:
-            ax.set_title("Grayscale", fontsize=12)
+    fig, axs = plt.subplots(3, num_images, figsize=(num_images * 2, 6))
+    row_titles = ["Grayscale", "Ground Truth", "Generated"]
 
-        ax = plt.subplot(3, 5, i + 1 + 5)
-        ax.imshow(ground_truth[i])
-        ax.axis("off")
-        if i == 2:
-            ax.set_title("Ground Truth", fontsize=12)
+    for i in range(num_images):
+        axs[0, i].imshow(grayscale[i], cmap="gray")
+        axs[1, i].imshow(ground_truth[i])
+        axs[2, i].imshow(generated_imgs[i])
 
-        ax = plt.subplot(3, 5, i + 1 + 10)
-        ax.imshow(generated_imgs[i])
-        ax.axis("off")
-        if i == 2:
-            ax.set_title("Generated", fontsize=12)
+    for i, ax_row in enumerate(axs):
+        for j, ax in enumerate(ax_row):
+            ax.axis("off")
+            if j == 0:
+                ax.set_title(row_titles[i], fontsize=12, loc="left", pad=0)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.show()
+    fig.subplots_adjust(
+        wspace=0.05, hspace=0.13, left=0.05, right=0.95, top=0.9, bottom=0.05
+    )
+
     if save:
         save_path.mkdir(exist_ok=True)
         path = save_path / f"generated_images_{epoch}.png"
@@ -372,31 +363,31 @@ def fit(
         torch.cuda.synchronize()
         epoch_end_time = time.time()
 
-        # mlflow.log_metric("train_G_loss", train_G_loss, step=epoch)
-        # mlflow.log_metric("train_D_loss", train_D_loss, step=epoch)
-        # mlflow.log_metric("train_L1_loss", train_L1_loss, step=epoch)
-        # mlflow.log_metric("val_G_loss", val_G_loss, step=epoch)
-        # mlflow.log_metric("val_D_loss", val_D_loss, step=epoch)
-        # mlflow.log_metric("val_L1_loss", val_L1_loss, step=epoch)
-        # mlflow.log_metric(
-        #     "epoch_duration", epoch_end_time - epoch_start_time, step=epoch
-        # )
+        mlflow.log_metric("train_G_loss", train_G_loss, step=epoch)
+        mlflow.log_metric("train_D_loss", train_D_loss, step=epoch)
+        mlflow.log_metric("train_L1_loss", train_L1_loss, step=epoch)
+        mlflow.log_metric("val_G_loss", val_G_loss, step=epoch)
+        mlflow.log_metric("val_D_loss", val_D_loss, step=epoch)
+        mlflow.log_metric("val_L1_loss", val_L1_loss, step=epoch)
+        mlflow.log_metric(
+            "epoch_duration", epoch_end_time - epoch_start_time, step=epoch
+        )
         print(
             f"Epoch: {epoch}, time_elapsed: {epoch_end_time - epoch_start_time:.2f} seconds | ",
-            f"train_G_loss: {train_G_loss:.3f} | train_L1_loss: {train_L1_loss:.3f} | train_D_loss: {train_D_loss:.3f} | ",
-            f"val_G_loss: {val_G_loss:.3f} | val_L1_loss: {val_L1_loss:.3f} | val_D_loss: {val_D_loss:.3f}",
+            f"train_G_loss: {G_train_losses[-1]:.3f} | train_L1_loss: {L1_train_losses[-1]:.3f} | train_D_loss: {D_train_losses[-1]:.3f} | ",
+            f"val_G_loss: {G_val_losses[-1]:.3f} | val_L1_loss: {L1_val_losses[-1]:.3f} | val_D_loss: {D_val_losses[-1]:.3f}",
             sep="\n",
         )
         if epoch % 20 == 0:
             avg_dssim = dssim / n_batches
             print(f"average dssim score : {avg_dssim}")
-            #mlflow.log_metric("val_dssim", avg_dssim, step=epoch)
-       # if epoch > 0 and epoch % 50 == 0:
-       #     print("Saving model checkpoints")
-       #     torch.save(G.state_dict(), Path(f"models/data_col_public/G_{epoch}.pt"))
-       #     torch.save(D.state_dict(), Path(f"models/data_col_public/D_{epoch}.pt"))
-        # visualize_batch(G, inputs, targets, epoch)
-        # generate_image(G, inputs[0], targets[0], epoch, f"epoch: {epoch}")
+            mlflow.log_metric("val_dssim", avg_dssim, step=epoch)
+        if epoch > 0 and epoch % 50 == 0:
+            print("Saving model checkpoints")
+            torch.save(G.state_dict(), Path(f"models/coco/G_{epoch}.pt"))
+            torch.save(D.state_dict(), Path(f"models/coco/D_{epoch}.pt"))
+        visualize_batch(G, inputs, targets, epoch)
+        generate_image(G, inputs[0], targets[0], epoch, f"epoch: {epoch}")
     print("Training finished!")
     return {
         "G_train_losses": G_train_losses,
@@ -425,22 +416,21 @@ def training(dataset_path: Path) -> None:
     print("Computing with {}!".format(device))
     # Set our tracking server uri for logging
     # RUN mlflow server --host 127.0.0.1 --port 5053
-    # mlflow.set_tracking_uri(uri="http://127.0.0.1:5053")
+    mlflow.set_tracking_uri(uri="http://127.0.0.1:5053")
     # print("Starting mlflow")
     # Create a new MLflow Experiment
 
-    run_name = "condGAN_RGB_300_epoch"
-    # mlflow.set_experiment("Colorization_01")
+    run_name = "condGAN_RGB_300_epoch_coco"
+    mlflow.set_experiment("Colorization_coco")
 
-    # try:
-    #     mlflow.start_run(run_name=run_name)
-    # except:
-    #     mlflow.end_run()
-    #     mlflow.start_run()
-    #
-    from dataset import get_image_paths_df
+    try:
+        mlflow.start_run(run_name=run_name)
+    except:
+        mlflow.end_run()
+        mlflow.start_run()
 
-    img_paths_df = get_image_paths_df(dataset_path)
+    img_paths_df = get_paths_df(dataset_path, ".jpg", 10240)  # limit to 10k images
+    print(f"Found {len(img_paths_df)} images in the dataset")
 
     train_dataset, val_dataset, test_dataset = split_dataset(img_paths_df, 0.10, 0.10)
 
@@ -476,16 +466,12 @@ def training(dataset_path: Path) -> None:
         device,
     )
 
-
     plot_learning_curves(losses_dict)
     draw_network_architecture(GAN(G, D), torch.rand((1, 3, 512, 384)).to(device))
     # torch.save(G.state_dict(), Path(f"models/G_{run_name}.pt"))
-    torch.save(G.state_dict(), Path(f"model.pt"))
+    torch.save(G.state_dict(), Path("model.pt"))
     # torch.save(D.state_dict(), Path(f"models/D_{run_name}.pt"))
-    # mlflow.end_run()
-
-
-# #### code below should not be changed ############################################################################
+    mlflow.end_run()
 
 
 def main() -> None:

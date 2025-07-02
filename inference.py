@@ -44,14 +44,14 @@ def inference(dataset_path: Path, model_path: Path) -> None:
     model = Generator().to(device)
     state_dict = torch.load(model_path)
     model.load_state_dict(state_dict)
-    # model.eval()
+    model.eval()
     # # From the pix2pix paper:
     # "At inference time, we run the generator net in exactly the same manner as during the training phase.
     # This differs from the usual protocol in that we apply dropout at test time"
 
     # The outputs seem more colorful when I run inference in the training mode but also some weird artifacts appear (weird blue blobs - perhaps too aggressive dropout?)
 
-    img_paths = get_image_paths(dataset_path)
+    img_paths = get_image_paths(dataset_path, 30)
 
     for input_img_path in tqdm(img_paths):
         input_img = pil_to_tensor(Image.open(input_img_path)) / 255
