@@ -1,7 +1,3 @@
-# STUDENT's UCO: 505941
-
-# Description:
-# This file should be used for performing inference on a network
 # Usage: inference.py <dataset_path> <model_path>
 
 from argparse import ArgumentParser
@@ -22,8 +18,7 @@ def get_image_paths(dataset_path: Path, n: int | None = None):
     return list(dataset_path.rglob("*.png"))
 
 
-# declaration for this function should not be changed
-@torch.no_grad()  # do not calculate the gradients
+@torch.no_grad()
 def inference(dataset_path: Path, model_path: Path) -> None:
     """Performs inference on the given dataset using the specified model.
 

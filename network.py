@@ -119,8 +119,6 @@ class Discriminator(nn.Module):
                 nn.Conv2d(512, 1, kernel_size=(4, 4), stride=1, padding=1),
             ]
         )
-        # attribution: I read at multiple places that this should help stabilize the GAN's training
-        # I'm not really knowledgable in whether it really works or if I'm even using it correctly
         for layer in layers[:-1]:
             nn.utils.parametrizations.spectral_norm(layer.downsample[0])
         nn.utils.parametrizations.spectral_norm(layers[-1])

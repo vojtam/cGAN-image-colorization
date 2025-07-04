@@ -1,8 +1,3 @@
-# STUDENT's UCO: 505941
-
-# Description:
-# This file should contain custom dataset class. The class should subclass the torch.utils.data.Dataset.
-
 from pathlib import Path
 
 import albumentations as A
