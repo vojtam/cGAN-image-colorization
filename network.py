@@ -44,7 +44,7 @@ class Generator(nn.Module):
         # Each block in the encoder is: Convolution -> Batch normalization -> Leaky ReLU
 
         down_filters = [
-            3,
+            1,
             64,
             64,
             128,
@@ -78,15 +78,14 @@ class Generator(nn.Module):
         self.output_layer = nn.Sequential(
             nn.ConvTranspose2d(
                 in_channels=up_filters[-1] * 2,
-                out_channels=3,
+                out_channels=2,
                 kernel_size=(4, 4),
                 stride=2,
                 padding=1,
                 bias=False,
             ),
-            # nn.Tanh(), # I don't really know why but replacing the tanh with sigmoid and not normalizing to [-1, 1] made the resulting images look better
-            # probably bug in my code
-            nn.Sigmoid(),
+            nn.Tanh(),
+            # nn.Sigmoid(),
         )
 
     def forward(self, x: Tensor) -> Tensor:

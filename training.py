@@ -1,5 +1,3 @@
-# Description:
-# This file should be used for performing training of a network
 # Usage: python training.py <dataset_path>
 
 import random
@@ -18,7 +16,13 @@ from torch.utils.data import DataLoader
 from torchview import draw_graph
 from tqdm import tqdm
 
-from dataset import WrappedDataLoader, get_paths_df, split_dataset
+from dataset import (
+    WrappedDataLoader,
+    get_paths_df,
+    lab_to_rgb_batch_np,
+    lab_to_rgb_np,
+    split_dataset,
+)
 from evaluation import dssim
 from network import GAN, Discriminator, Generator, discriminator_loss, generator_loss
 
@@ -105,18 +109,13 @@ def generate_image(
         input.unsqueeze(0)
     )  # add a batch dimension so that I can feed it to the Generator
     model.train()
-    target_np = target.permute(1, 2, 0).cpu().detach().numpy()
-    predicted_np = predicted.squeeze().permute(1, 2, 0).cpu().detach().numpy()
-    input_np = input.permute(1, 2, 0).cpu().detach().numpy()
+    predicted_np = lab_to_rgb_np(input, predicted.squeeze())
+    target_np = lab_to_rgb_np(input, target)
+    input_np = (input.permute(1, 2, 0).cpu().detach().numpy() + 1.0) / 2.0
 
-    if input_np.min() < 0 or input_np.max() > 1:
-        input_np = scale_to_zero_one(input_np)
-
-    if target_np.min() < 0 or target_np.max() > 1:
-        target_np = scale_to_zero_one(target_np)
-
-    if predicted_np.min() < 0 or predicted_np.max() > 1:
-        predicted_np = scale_to_zero_one(predicted_np)
+    predicted_np = np.clip(predicted_np, 0.0, 1.0)
+    target_np = np.clip(target_np, 0.0, 1.0)
+    input_np = np.clip(input_np, 0.0, 1.0)
 
     plt.figure(figsize=(10, 5))
 
@@ -147,33 +146,36 @@ def generate_image(
 @torch.no_grad
 def visualize_batch(
     model: Generator,
-    inputs: Tensor,
-    targets: Tensor,
+    inputs: Tensor,  # Batch of L channels
+    targets: Tensor,  # Batch of ab channels
     epoch: int,
     num_images: int = 4,
     save=True,
     save_path=Path("gen_images/batch"),
 ):
     model.eval()
-    generated_imgs = model(inputs).cpu().permute(0, 2, 3, 1).numpy()
+    num_images = min(num_images, inputs.shape[0])
+
+    inputs_slice = inputs[:num_images]
+    targets_slice = targets[:num_images]
+    predicted_ab_slice = model(inputs_slice)
     model.train()
-    grayscale = inputs.cpu().permute(0, 2, 3, 1).numpy()
-    ground_truth = targets.cpu().permute(0, 2, 3, 1).numpy()
 
-    if grayscale.min() < 0 or grayscale.max() > 1:
-        grayscale = scale_to_zero_one(grayscale)
+    generated_imgs = lab_to_rgb_batch_np(inputs_slice, predicted_ab_slice)
+    ground_truth = lab_to_rgb_batch_np(inputs_slice, targets_slice)
 
-    if ground_truth.min() < 0 or ground_truth.max() > 1:
-        ground_truth = scale_to_zero_one(ground_truth)
+    grayscale = (inputs_slice + 1.0) / 2.0  # Map from [-1, 1] to [0, 1]
+    grayscale = grayscale.repeat(1, 3, 1, 1).cpu().permute(0, 2, 3, 1).numpy()
 
-    if generated_imgs.min() < 0 or generated_imgs.max() > 1:
-        generated_imgs = scale_to_zero_one(generated_imgs)
+    generated_imgs = np.clip(generated_imgs, 0.0, 1.0)
+    ground_truth = np.clip(ground_truth, 0.0, 1.0)
+    grayscale = np.clip(grayscale, 0.0, 1.0)
 
-    fig, axs = plt.subplots(3, num_images, figsize=(num_images * 2, 6))
+    fig, axs = plt.subplots(3, num_images, figsize=(num_images * 2.5, 7.5))
     row_titles = ["Grayscale", "Ground Truth", "Generated"]
 
     for i in range(num_images):
-        axs[0, i].imshow(grayscale[i], cmap="gray")
+        axs[0, i].imshow(grayscale[i])
         axs[1, i].imshow(ground_truth[i])
         axs[2, i].imshow(generated_imgs[i])
 
@@ -181,16 +183,15 @@ def visualize_batch(
         for j, ax in enumerate(ax_row):
             ax.axis("off")
             if j == 0:
-                ax.set_title(row_titles[i], fontsize=12, loc="left", pad=0)
+                ax.set_title(row_titles[i], fontsize=12, loc="left", pad=10)
 
-    fig.subplots_adjust(
-        wspace=0.05, hspace=0.13, left=0.05, right=0.95, top=0.9, bottom=0.05
-    )
+    fig.suptitle(f"Epoch: {epoch}", fontsize=16)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
 
     if save:
         save_path.mkdir(exist_ok=True)
         path = save_path / f"generated_images_{epoch}.png"
-        print(f"Sample colorized image saved to {path}")
+        print(f"Sample colorized batch saved to {path}")
         plt.savefig(path)
         plt.close()
     else:
@@ -209,7 +210,7 @@ def train_step(
     optimizer_D.zero_grad()
     optimizer_G.zero_grad()
 
-    generator_output = G(inputs)  #
+    generator_output = G(inputs)
     generated = torch.concat(
         (inputs, generator_output.detach()), dim=1
     )  # Note to self: need to use detach here to keep the computational graphs separate -> otherwise backprop would break
@@ -266,13 +267,8 @@ def valid_step(
     G_total_loss = G_loss + G_L1_loss
 
     if epoch % 20 == 0:
-        pred_RGB = (
-            scale_to_zero_one(
-                generator_output.cpu().to(torch.float32).permute(0, 2, 3, 1).numpy()
-            )
-            * 255
-        )
-        ref_RGB = scale_to_zero_one(targets.cpu().permute(0, 2, 3, 1).numpy()) * 255
+        pred_RGB = lab_to_rgb_batch_np(inputs, generator_output) * 255
+        ref_RGB = lab_to_rgb_batch_np(inputs, targets) * 255
         dssim_score = 0
         for ref_img, pred_img in zip(ref_RGB, pred_RGB):
             dssim_score += dssim(ref_img.astype(np.uint8), pred_img.astype(np.uint8))
@@ -449,7 +445,7 @@ def training(dataset_path: Path) -> None:
 
     torch.set_float32_matmul_precision("high")
 
-    D = Discriminator(6).to(device)
+    D = Discriminator(3).to(device)
     G = Generator().to(device)
 
     optimizer_G = Adam(G.parameters(), lr=config.G_lr, betas=config.momentum_betas)

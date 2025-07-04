@@ -1,7 +1,3 @@
-# STUDENT's UCO: 505941
-
-# Description:
-# This file should be used for performing inference on a network
 # Usage: inference.py <dataset_path> <model_path>
 
 from argparse import ArgumentParser
@@ -22,8 +18,7 @@ def get_image_paths(dataset_path: Path, n: int | None = None):
     return list(dataset_path.rglob("*.png"))
 
 
-# declaration for this function should not be changed
-@torch.no_grad()  # do not calculate the gradients
+@torch.no_grad()
 def inference(dataset_path: Path, model_path: Path) -> None:
     """Performs inference on the given dataset using the specified model.
 
@@ -33,8 +28,7 @@ def inference(dataset_path: Path, model_path: Path) -> None:
         model_path: Path to the model file.
 
     Saves:
-        predictions to 'output_predictions' folder. The files can be saved in a flat
-            structure with the same name as the input file.
+        predictions to 'output_predictions' folder.
     """
     # Check for available GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -71,7 +65,6 @@ def inference(dataset_path: Path, model_path: Path) -> None:
         Image.fromarray(generated_image).save(path_to_save)
 
 
-# #### code below should not be changed ############################################################################
 def main() -> None:
     parser = ArgumentParser(description="Inference script for a neural network.")
     parser.add_argument("dataset_path", type=Path, help="Path to the dataset")
